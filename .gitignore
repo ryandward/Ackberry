@@ -1,0 +1,5 @@
+node_modules/
+build/
+elm-stuff/
+.test-data/
+data/

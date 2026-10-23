@@ -1,0 +1,22 @@
+{
+  "name": "ackberry",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Headless HTTP server in pure Elm: a transaction algebra interpreted by a zero-decision Node bridge",
+  "scripts": {
+    "build": "elm make src/Main.elm --optimize --output=build/main.js",
+    "build:spec": "elm make spec/TxSpec.elm --output=build/tx-spec.js",
+    "build:bench": "elm make bench/BlobBench.elm --optimize --output=build/blob-bench.js",
+    "start": "npm run build && node server.js",
+    "upstream": "node upstream.js",
+    "test": "elm-test && npm run build && npm run build:spec && node tests/vm.js 5000 && node --expose-gc tests/acceptance.js",
+    "bench": "npm run build && npm run build:bench && node bench/blob-bench.js",
+    "format": "elm-format --yes src tests bench spec"
+  },
+  "devDependencies": {
+    "autocannon": "8.0.0",
+    "elm": "0.19.1-6",
+    "elm-format": "0.8.8",
+    "elm-test": "0.19.1-revision17"
+  }
+}
