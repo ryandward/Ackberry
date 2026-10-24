@@ -4,14 +4,18 @@ module Http.Response exposing
     , Linger
     , Response
     , Wire
+    , continue
     , created
     , emptyOctets
     , ok
     , okJsonText
     , problem
+    , serialize
+    , serializeStreamHead
     , status
     , streamHead
     , toWire
+    , utf8Length
     )
 
 {-| Wire response types and builders.
@@ -25,6 +29,7 @@ throwing on a bad header.
 
 -}
 
+import Http.Date as Date exposing (Date)
 import Http.Request as Request exposing (JsonText, Method)
 import Json.Encode as Encode
 
@@ -52,11 +57,15 @@ type Failure
     | Conflict
     | RequestTimeout
     | PayloadTooLarge
+    | UriTooLong
+    | ExpectationFailed
+    | HeaderFieldsTooLarge
     | InternalServerError
     | NotImplemented
     | BadGateway
     | ServiceUnavailable
     | GatewayTimeout
+    | VersionNotSupported
     | InsufficientStorage
 
 
@@ -182,6 +191,15 @@ failureCode failure =
         PayloadTooLarge ->
             413
 
+        UriTooLong ->
+            414
+
+        ExpectationFailed ->
+            417
+
+        HeaderFieldsTooLarge ->
+            431
+
         InternalServerError ->
             500
 
@@ -196,6 +214,9 @@ failureCode failure =
 
         GatewayTimeout ->
             504
+
+        VersionNotSupported ->
+            505
 
         InsufficientStorage ->
             507
@@ -222,6 +243,15 @@ failureTitle failure =
         PayloadTooLarge ->
             "Content Too Large"
 
+        UriTooLong ->
+            "URI Too Long"
+
+        ExpectationFailed ->
+            "Expectation Failed"
+
+        HeaderFieldsTooLarge ->
+            "Request Header Fields Too Large"
+
         InternalServerError ->
             "Internal Server Error"
 
@@ -236,6 +266,9 @@ failureTitle failure =
 
         GatewayTimeout ->
             "Gateway Timeout"
+
+        VersionNotSupported ->
+            "HTTP Version Not Supported"
 
         InsufficientStorage ->
             "Insufficient Storage"
@@ -340,6 +373,15 @@ allowHeader failure =
         PayloadTooLarge ->
             []
 
+        UriTooLong ->
+            []
+
+        ExpectationFailed ->
+            []
+
+        HeaderFieldsTooLarge ->
+            []
+
         InternalServerError ->
             []
 
@@ -355,5 +397,142 @@ allowHeader failure =
         GatewayTimeout ->
             []
 
+        VersionNotSupported ->
+            []
+
         InsufficientStorage ->
             []
+
+
+
+-- THE BYTES ON THE WIRE
+
+
+{-| A response exactly as the bridge writes it, encoded as UTF-8: the status
+line, the header fields, an empty line, the body. The framing is always a
+`Content-Length`, the count of the body's UTF-8 octets; the bridge never
+adds, measures or rewrites anything. `closes` adds `connection: close`.
+-}
+serialize : Date -> Bool -> Response -> String
+serialize date closes response =
+    let
+        wire =
+            render response
+    in
+    head wire.status
+        (reasonOf response)
+        (wire.headers ++ [ "content-length", String.fromInt (utf8Length wire.body) ])
+        date
+        closes
+        ++ wire.body
+
+
+{-| The head of a download, whose body the bridge streams from a file of
+exactly `length` bytes.
+-}
+serializeStreamHead : Date -> Bool -> Int -> String
+serializeStreamHead date closes length =
+    let
+        h =
+            streamHead length
+    in
+    head h.status (codeTitle Ok200) h.headers date closes
+
+
+{-| The interim response that invites a body the client is holding back
+(RFC 9110 section 10.1.1).
+-}
+continue : String
+continue =
+    "HTTP/1.1 100 Continue\u{000D}\n\u{000D}\n"
+
+
+{-| `headers` is the flat `[name, value, ...]` list this module builds.
+-}
+head : Int -> String -> List String -> Date -> Bool -> String
+head code phrase headers date closes =
+    let
+        fields =
+            pairs headers
+                ++ [ ( "date", Date.toString date ) ]
+                ++ (if closes then
+                        [ ( "connection", "close" ) ]
+
+                    else
+                        []
+                   )
+    in
+    "HTTP/1.1 "
+        ++ String.fromInt code
+        ++ " "
+        ++ phrase
+        ++ crlf
+        ++ String.concat (List.map (\( name, value ) -> name ++ ": " ++ value ++ crlf) fields)
+        ++ crlf
+
+
+crlf : String
+crlf =
+    "\u{000D}\n"
+
+
+pairs : List String -> List ( String, String )
+pairs flat =
+    case flat of
+        name :: value :: rest ->
+            ( name, value ) :: pairs rest
+
+        _ ->
+            []
+
+
+{-| Exhaustive over the response, so a new status cannot go out without
+its phrase.
+-}
+reasonOf : Response -> String
+reasonOf response =
+    case response of
+        Success code _ ->
+            codeTitle code
+
+        Problem failure _ _ ->
+            failureTitle failure
+
+
+codeTitle : Code -> String
+codeTitle code =
+    case code of
+        Ok200 ->
+            "OK"
+
+        Created201 ->
+            "Created"
+
+
+{-| The number of octets `text` takes as UTF-8. Elm iterates code points; a
+lone surrogate, which Node writes as U+FFFD, takes three either way.
+-}
+utf8Length : String -> Int
+utf8Length text =
+    String.foldl
+        (\c n ->
+            let
+                code =
+                    Char.toCode c
+            in
+            n
+                + (if code < 0x80 then
+                    1
+
+                   else if code < 0x0800 then
+                    2
+
+                   else if code < 0x00010000 then
+                    3
+
+                   else
+                    4
+                  )
+        )
+        0
+        text
