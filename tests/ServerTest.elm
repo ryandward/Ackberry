@@ -12,8 +12,9 @@ import Http.Response as Response
 import Io exposing (HostError, Op)
 import Json.Decode as Decode
 import Json.Encode as Encode
+import Layout
 import Plan
-import Server exposing (Effect(..), Msg(..))
+import Server exposing (Effect(..), Msg(..), Owner(..))
 import Test exposing (Test, describe, test)
 import Tx
 import Verdict
@@ -30,6 +31,8 @@ config =
     , jsonLimit = 1048576
     , uploadLimit = 104857600
     , progressEveryMs = 100
+    , staleAfterMs = 7200000
+    , sweepEveryMs = 900000
     }
 
 
@@ -42,8 +45,12 @@ a =
 -- SIMULATION
 
 
+{-| One owner's transactions, run on the reference machine. Effects for
+other owners are recorded but not run.
+-}
 type alias Sim =
     { model : Server.Model
+    , owner : Owner
     , machine : Maybe Tx.Machine
     , effects : List Effect
     , performed : List Op
@@ -61,7 +68,19 @@ wire method target headers =
 
 arrive : String -> String -> List ( String, String ) -> Sim
 arrive method target headers =
-    feed (Received a 0 (wire method target headers)) { model = Server.init config, machine = Nothing, effects = [], performed = [] }
+    feed (Received a 0 (wire method target headers))
+        { model = Tuple.first (Server.init config), owner = Exchange a, machine = Nothing, effects = [], performed = [] }
+
+
+{-| A server just started, following its janitor.
+-}
+booting : Server.Config -> Sim
+booting cfg =
+    let
+        ( model, effects ) =
+            Server.init cfg
+    in
+    List.foldl applyEffect { model = model, owner = Janitor, machine = Nothing, effects = effects, performed = [] } effects
 
 
 withBody : String -> List ( String, String )
@@ -81,14 +100,26 @@ feed msg sim =
 applyEffect : Effect -> Sim -> Sim
 applyEffect effect sim =
     case effect of
-        Begin _ program ->
-            run (Tx.boot (Plan.steps program) (Plan.continuation program)) sim
+        Begin owner program ->
+            if owner == sim.owner then
+                run (Tx.boot (Plan.steps program) (Plan.continuation program)) sim
 
-        Extend _ program ->
-            onMachine (Tx.append (Plan.steps program) (Plan.continuation program)) sim
+            else
+                sim
 
-        Abort _ ->
-            onMachine Tx.preempt sim
+        Extend owner program ->
+            if owner == sim.owner then
+                onMachine (Tx.append (Plan.steps program) (Plan.continuation program)) sim
+
+            else
+                sim
+
+        Abort id ->
+            if Exchange id == sim.owner then
+                onMachine Tx.preempt sim
+
+            else
+                sim
 
         _ ->
             sim
@@ -119,7 +150,7 @@ run ( machine, reports ) sim =
                 ( Nothing, _ ) ->
                     sim.performed
     in
-    List.foldl (\r s -> feed (Reported a (Tx.encodeReport r)) s) { sim | machine = Just machine, performed = started } reports
+    List.foldl (\r s -> feed (Reported s.owner (Tx.encodeReport r)) s) { sim | machine = Just machine, performed = started } reports
 
 
 {-| The host finishes whatever is in flight. A signalled interruptible op
@@ -246,6 +277,84 @@ isUnlink op =
             False
 
 
+isEnsureDir : Op -> Bool
+isEnsureDir op =
+    case op of
+        Io.EnsureDir _ ->
+            True
+
+        _ ->
+            False
+
+
+{-| What the janitor's host shows it: a listing taken at `at`, and unlinks
+that fail where `unlinkFails` says so.
+-}
+type Listed
+    = File String Float
+    | Directory String Float
+    | Unreadable String String
+
+
+janitorHost : Int -> List Listed -> (String -> Maybe String) -> Op -> Result HostError Decode.Value
+janitorHost at listed unlinkFails op =
+    let
+        meta isFile mtime =
+            Encode.object [ ( "ok", Encode.object [ ( "isFile", Encode.bool isFile ), ( "mtimeMs", Encode.float mtime ) ] ) ]
+
+        entry item =
+            case item of
+                File name mtime ->
+                    Encode.object [ ( "name", Encode.string name ), ( "stat", meta True mtime ) ]
+
+                Directory name mtime ->
+                    Encode.object [ ( "name", Encode.string name ), ( "stat", meta False mtime ) ]
+
+                Unreadable name code ->
+                    Encode.object [ ( "name", Encode.string name ), ( "stat", Encode.object [ ( "error", Io.encodeHostError (hostError code "lstat") ) ] ) ]
+    in
+    case op of
+        Io.ListDir _ ->
+            Ok (Encode.object [ ( "at", Encode.int at ), ( "entries", Encode.list entry listed ) ])
+
+        Io.UnlinkEach paths ->
+            Ok
+                (Encode.object
+                    [ ( "outcomes"
+                      , Encode.list
+                            (\path ->
+                                case unlinkFails path of
+                                    Nothing ->
+                                        Encode.object [ ( "ok", Encode.object [] ) ]
+
+                                    Just code ->
+                                        Encode.object [ ( "error", Io.encodeHostError (hostError code "unlink") ) ]
+                            )
+                            paths
+                      )
+                    ]
+                )
+
+        _ ->
+            Ok (Encode.object [])
+
+
+{-| The paths the janitor was told to remove.
+-}
+doomed : Sim -> List String
+doomed sim =
+    List.concatMap
+        (\op ->
+            case op of
+                Io.UnlinkEach paths ->
+                    paths
+
+                _ ->
+                    []
+        )
+        sim.performed
+
+
 
 -- OBSERVATIONS
 
@@ -323,6 +432,15 @@ opName op =
         Io.Stream _ ->
             "stream"
 
+        Io.EnsureDir path ->
+            "ensure-dir " ++ path
+
+        Io.ListDir path ->
+            "list-dir " ++ path
+
+        Io.UnlinkEach paths ->
+            "unlink-each " ++ String.join "," paths
+
 
 faults : Sim -> List Verdict.Fault
 faults sim =
@@ -355,7 +473,13 @@ kinds sim =
                 Begin _ _ ->
                     Just "begin"
 
-                _ ->
+                Listen ->
+                    Just "listen"
+
+                Halt _ ->
+                    Just "halt"
+
+                Report _ _ ->
                     Nothing
         )
         sim.effects
@@ -372,8 +496,8 @@ payload =
 
 
 commitOps : String -> String -> String -> List String
-commitOps fill tmp final =
-    [ "open " ++ tmp, fill, "fsync", "link " ++ final, "unlink " ++ tmp, "fsync-dir /d", "close" ]
+commitOps fill final dir =
+    [ "open /d/.tmp/a.part", fill, "fsync", "link " ++ final, "unlink /d/.tmp/a.part", "fsync-dir " ++ dir, "close" ]
 
 
 
@@ -389,7 +513,7 @@ suite =
                     arrive "POST" "/ingest/42" (withBody payload)
                         |> answerAll (host payload)
                         |> Expect.all
-                            [ names >> Expect.equal ("read-body" :: commitOps "write" "/d/file_42.tmp" "/d/file_42.final")
+                            [ names >> Expect.equal ("read-body" :: commitOps "write" "/d/file_42.final" "/d")
                             , one (\w -> Expect.equal ( 201, "{\"itemId\":42,\"bytes\":17,\"sha256\":\"abc123\"}" ) ( w.status, w.body ))
                             , answers >> List.map Tuple.second >> Expect.equal [ Response.KeepAlive ]
                             , settled
@@ -407,15 +531,16 @@ suite =
                                         , String.contains "/secret" w.body
                                         )
                                 )
-                            , names >> Expect.equal [ "read-body", "open /d/file_42.tmp" ]
+                            , names >> Expect.equal [ "read-body", "open /d/.tmp/a.part" ]
                             , settled
                             ]
-            , test "EEXIST on the lease is 409, and the holder's temp file is never touched" <|
+            , test "EEXIST on a fresh part is a broken invariant, not a conflict: 500, an anomaly, and the file is never touched" <|
                 \_ ->
                     arrive "POST" "/ingest/42" (withBody payload)
                         |> answerAll (failing isOpen "EEXIST" "open" payload)
                         |> Expect.all
-                            [ one (statusIs 409)
+                            [ one (statusIs 500)
+                            , faults >> List.length >> Expect.equal 1
                             , names >> List.filter (String.startsWith "unlink") >> Expect.equal []
                             ]
             , test "a link that finds the final file is 409, and the rollback removes only our temp file" <|
@@ -424,7 +549,7 @@ suite =
                         |> answerAll (failing isLink "EEXIST" "link" payload)
                         |> Expect.all
                             [ one (statusIs 409)
-                            , names >> List.drop 4 >> Expect.equal [ "link /d/file_42.final", "unlink /d/file_42.tmp", "close" ]
+                            , names >> List.drop 4 >> Expect.equal [ "link /d/file_42.final", "unlink /d/.tmp/a.part", "close" ]
                             , settled
                             ]
             , test "a rollback whose unlink is denied reports the orphan" <|
@@ -443,12 +568,12 @@ suite =
                         |> Expect.all [ one (statusIs 400), names >> Expect.equal [ "read-body" ], settled ]
             ]
         , describe "streamed upload"
-            [ test "PUT streams the socket into the leased temp file and commits it" <|
+            [ test "PUT streams the socket into the transaction's own part and links it to the blob's name" <|
                 \_ ->
                     arrive "PUT" "/blobs/9" [ ( "Content-Length", "10485760" ) ]
                         |> answerAll (host "")
                         |> Expect.all
-                            [ names >> Expect.equal (commitOps "pipe-body" "/d/blob_9.tmp" "/d/blob_9.bin")
+                            [ names >> Expect.equal (commitOps "pipe-body" "/d/blobs/9" "/d/blobs")
                             , one (\w -> Expect.equal ( 201, "{\"blobId\":9,\"bytes\":10485760,\"sha256\":\"f00d\"}" ) ( w.status, w.body ))
                             , settled
                             ]
@@ -467,7 +592,7 @@ suite =
                         |> feed (ClientGone a)
                         |> answerAll (host "")
                         |> Expect.all
-                            [ names >> Expect.equal [ "open /d/blob_9.tmp", "pipe-body", "unlink /d/blob_9.tmp", "close" ]
+                            [ names >> Expect.equal [ "open /d/.tmp/a.part", "pipe-body", "unlink /d/.tmp/a.part", "close" ]
                             , answers >> Expect.equal []
                             , kinds >> Expect.equal [ "begin", "abort" ]
                             , \sim -> Expect.equal 1 sim.model.ledger.abandoned
@@ -485,7 +610,7 @@ suite =
                             [ kinds >> Expect.equal [ "begin", "respond", "abort" ]
                             , one (statusIs 408)
                             , answers >> List.map Tuple.second >> Expect.equal [ Response.CloseAfter ]
-                            , names >> Expect.equal [ "open /d/blob_9.tmp", "pipe-body", "unlink /d/blob_9.tmp", "close" ]
+                            , names >> Expect.equal [ "open /d/.tmp/a.part", "pipe-body", "unlink /d/.tmp/a.part", "close" ]
                             , \sim -> Expect.equal 1 sim.model.ledger.tooSlow
                             , settled
                             ]
@@ -547,7 +672,7 @@ suite =
                         |> feed (ClientGone a)
                         |> answerAll (host "")
                         |> Expect.all
-                            [ names >> Expect.equal (commitOps "pipe-body" "/d/blob_9.tmp" "/d/blob_9.bin")
+                            [ names >> Expect.equal (commitOps "pipe-body" "/d/blobs/9" "/d/blobs")
                             , answers >> Expect.equal []
                             , settled
                             ]
@@ -558,7 +683,7 @@ suite =
                     arrive "GET" "/blobs/1" []
                         |> answerAll (host "")
                         |> Expect.all
-                            [ names >> Expect.equal [ "open /d/blob_1.bin", "stat", "stream", "close" ]
+                            [ names >> Expect.equal [ "open /d/blobs/1", "stat", "stream", "close" ]
                             , answers >> Expect.equal []
                             , \sim -> Expect.equal 1 sim.model.ledger.responded
                             , settled
@@ -573,7 +698,7 @@ suite =
                         |> answerAll (host "")
                         |> Expect.all
                             [ kinds >> Expect.equal [ "begin", "extend", "abort" ]
-                            , names >> Expect.equal [ "open /d/blob_1.bin", "stat", "stream", "close" ]
+                            , names >> Expect.equal [ "open /d/blobs/1", "stat", "stream", "close" ]
                             , settled
                             ]
             , test "ENOENT is the only error that means missing: 404" <|
@@ -599,7 +724,7 @@ suite =
                                         host "" op
                             )
                         |> Expect.all
-                            [ one (statusIs 500), names >> Expect.equal [ "open /d/blob_7.bin", "stat", "close" ], settled ]
+                            [ one (statusIs 500), names >> Expect.equal [ "open /d/blobs/7", "stat", "close" ], settled ]
             ]
         , describe "upstream"
             [ test "the deadline answers 504 and aborts; the severed call answers nobody" <|
@@ -647,5 +772,144 @@ suite =
                         ( arrive "PURGE" "/health" [] |> answers |> List.map (Tuple.first >> .status)
                         , arrive "PUT" "/health" [] |> answers |> List.map (Tuple.first >> .status)
                         )
+            ]
+        , describe "the janitor"
+            [ test "the server opens only once its layout exists: prepare, then Listen and a survey" <|
+                \_ ->
+                    booting config
+                        |> answer (janitorHost 0 [] (always Nothing))
+                        |> answer (janitorHost 0 [] (always Nothing))
+                        |> Expect.all
+                            [ names >> Expect.equal [ "ensure-dir /d/.tmp", "ensure-dir /d/blobs", "list-dir /d/.tmp" ]
+                            , kinds >> Expect.equal [ "begin", "listen", "begin" ]
+                            ]
+            , test "a layout that cannot be prepared halts: no Listen, no sweep, no alarm, the host error logged" <|
+                \_ ->
+                    booting config
+                        |> answerAll (failing isEnsureDir "EACCES" "mkdir" "")
+                        |> Expect.all
+                            [ kinds >> Expect.equal [ "begin", "halt" ]
+                            , faults >> List.length >> Expect.equal 1
+                            , \sim -> Expect.equal Nothing (Server.sweepEvery sim.model)
+                            ]
+            , test "a server closed while it boots never opens" <|
+                \_ ->
+                    booting config
+                        |> feed Closed
+                        |> answerAll (janitorHost 0 [] (always Nothing))
+                        |> Expect.all
+                            [ kinds >> Expect.equal [ "begin" ]
+                            , \sim -> Expect.equal Nothing (Server.sweepEvery sim.model)
+                            ]
+            , test "a staleAfterMs no longer than the transfer deadline refuses to start" <|
+                \_ ->
+                    Server.init { config | staleAfterMs = config.transferDeadlineMs }
+                        |> Tuple.second
+                        |> List.map
+                            (\effect ->
+                                case effect of
+                                    Halt _ ->
+                                        "halt"
+
+                                    _ ->
+                                        "other"
+                            )
+                        |> Expect.equal [ "halt" ]
+            , test "a sweep removes exactly the stale parts, and only regular files named like parts" <|
+                \_ ->
+                    let
+                        now =
+                            10000000
+
+                        listing =
+                            [ File "old.part" 1000000
+                            , File "young.part" 9000000
+                            , File "notes.txt" 0
+                            , Directory "dir.part" 0
+                            , File ".part" 0
+                            , Unreadable "gone.part" "ENOENT"
+                            , Unreadable "sick.part" "EIO"
+                            ]
+                    in
+                    booting config
+                        |> answerAll (janitorHost now listing (always Nothing))
+                        |> Expect.all
+                            [ doomed >> Expect.equal [ "/d/.tmp/old.part" ]
+                            , faults >> List.length >> Expect.equal 1 >> Expect.onFail "the unreadable part, and only it, is reported"
+                            , \sim -> Expect.equal 1 sim.model.ledger.swept
+                            , \sim -> Expect.equal (Just config.sweepEveryMs) (Server.sweepEvery sim.model)
+                            ]
+            , test "staleness is judged by the host clock at the listing, never by Elm's clock" <|
+                \_ ->
+                    -- Elm last read its clock far in the future; the host
+                    -- listed at 10 000 000. By Elm's clock young.part would
+                    -- look ancient.
+                    booting config
+                        |> feed (Tick 99999999999)
+                        |> answerAll (janitorHost 10000000 [ File "young.part" 9000000 ] (always Nothing))
+                        |> doomed
+                        |> Expect.equal []
+            , test "a part held by a live upload is never taken, even when its mtime says stale" <|
+                \_ ->
+                    booting config
+                        |> answer (janitorHost 0 [] (always Nothing))
+                        |> answer (janitorHost 0 [] (always Nothing))
+                        |> feed (Received a 0 (wire "PUT" "/blobs/9" [ ( "Content-Length", "10485760" ) ]))
+                        |> answerAll (janitorHost 99999999 [ File "a.part" 0, File "dead.part" 0 ] (always Nothing))
+                        |> doomed
+                        |> Expect.equal [ "/d/.tmp/dead.part" ]
+            , test "an unlink that fails is an orphan, one that finds nothing is not; the rest still go" <|
+                \_ ->
+                    booting config
+                        |> answerAll
+                            (janitorHost 99999999
+                                [ File "a1.part" 0, File "a2.part" 0, File "a3.part" 0 ]
+                                (\path ->
+                                    if path == "/d/.tmp/a2.part" then
+                                        Just "EACCES"
+
+                                    else if path == "/d/.tmp/a3.part" then
+                                        Just "ENOENT"
+
+                                    else
+                                        Nothing
+                                )
+                            )
+                        |> Expect.all
+                            [ doomed >> Expect.equal [ "/d/.tmp/a1.part", "/d/.tmp/a2.part", "/d/.tmp/a3.part" ]
+                            , \sim -> Expect.equal ( 1, 1 ) ( sim.model.ledger.swept, sim.model.ledger.orphans )
+                            ]
+            , test "the alarm starts a sweep only between sweeps, and a listing that fails is reported and retried later" <|
+                \_ ->
+                    booting config
+                        |> answer (janitorHost 0 [] (always Nothing))
+                        |> answer (janitorHost 0 [] (always Nothing))
+                        |> feed SweepDue
+                        |> answerAll (failing (always True) "EIO" "scandir" "")
+                        |> feed SweepDue
+                        |> Expect.all
+                            [ kinds >> Expect.equal [ "begin", "listen", "begin", "begin" ]
+                            , faults >> List.length >> Expect.equal 1
+                            ]
+            ]
+        , describe "layout"
+            [ test "partFromName inverts part for a UUID, and refuses names part could not have made" <|
+                \_ ->
+                    let
+                        layout =
+                            Layout.fromDataDir "/d"
+
+                        uuid =
+                            "0f8fad5b-d9cb-469f-a165-70867728950e"
+                    in
+                    Expect.equal
+                        ( Just (Layout.part layout (Request.idFromString uuid)), [ Nothing, Nothing, Nothing, Nothing ] )
+                        ( Layout.partFromName layout (uuid ++ ".part")
+                        , List.map (Layout.partFromName layout) [ uuid ++ ".tmp", ".part", "notes", "blob_9.tmp" ]
+                        )
+            , test "a part is named after its transaction, never after the item it will become" <|
+                \_ ->
+                    Layout.partPath (Layout.part (Layout.fromDataDir "/d") (Request.idFromString "r7"))
+                        |> Expect.equal "/d/.tmp/r7.part"
             ]
         ]

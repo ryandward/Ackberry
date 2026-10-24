@@ -17,8 +17,9 @@ abort, and watches every streaming step through a rate meter.
 | --- | --- |
 | `src/Tx.elm` | The transaction algebra (`Do op cleanups`, `Commit op`, `Always`/`OnFailure` cleanups, `Pause`/`Finish`, abort), its seven laws, and a pure reference interpreter |
 | `src/Plan.elm` | Typestate builder: the only way the server can construct a transaction. A lease without its cleanups, a commit before fsync, or a write into an unleased file does not compile |
-| `src/Server.elm` | The router as a pure state machine. Deadlines and rate meters are data, checked by a clock subscription that exists only while jobs do |
-| `src/Commit.elm` | Create-only commit: `open(O_EXCL)` lease, write or stream, `fsync`, `link`, `unlink`, `fsync(dir)` |
+| `src/Server.elm` | The router as a pure state machine. Deadlines and rate meters are data, checked by a clock subscription that exists only while jobs do. Also the janitor, which prepares the data directory before the server listens and collects the parts crashed processes leave |
+| `src/Layout.elm` | Every path the server touches. In-flight bytes live in `.tmp/<transaction>.part`, named after the transaction and never after the resource it will become |
+| `src/Commit.elm` | Create-only commit: `open(O_EXCL)` an anonymous part, write or stream, `fsync`, `link` it to the final name, `unlink` the part, `fsync` the final's directory |
 | `src/Http/` | Request and response types; a bidirectional route codec with round-trip laws |
 | `src/Io.elm`, `src/Verdict.elm` | Host primitives, host-error classification, and the failure tables that turn host errors into answers |
 | `server.js` | The bridge: HTTP front end, resource table, and the transaction interpreter |
@@ -32,17 +33,39 @@ abort, and watches every streaming step through a rate meter.
 | `POST /echo` | Reflects the exact JSON bytes sent |
 | `GET /delayed/:id` | Fetches the item from the upstream over real HTTP |
 | `POST /ingest/:id` | Commits a JSON object to `file_<id>.final`, create-only, returns its sha256 |
-| `PUT /blobs/:id` | Streams the body to disk and commits it to `blob_<id>.bin`, create-only |
-| `GET /blobs/:id` | Streams a committed blob back with an exact Content-Length |
+| `PUT /blobs/:id` | Streams the body into an anonymous part and commits it to `blobs/<id>`, create-only |
+| `GET /blobs/:id` | Streams `blobs/<id>` back with an exact Content-Length |
+
+## Crashes
+
+A process killed mid-upload (SIGKILL, the OOM killer, a power cut) leaves its
+part in `<data>/.tmp/`. The part is named after the dead transaction, so it
+blocks nothing: a retry of the same id streams into its own part and commits.
+Uploads to one id never exclude each other; they race at the commit, where
+`link(2)` lets exactly one win, so a 409 means exactly one thing: the id is
+already committed. `tests/crash.js` kills the real process mid-upload and
+checks all of this.
+
+The commit is `link` then `unlink`, not `rename`: with nothing excluding two
+uploads to one id, `rename` would let the second silently replace the first
+after both clients were told 201.
+
+Corpses are collected by the janitor: at boot and then every `sweepEveryMs`
+(15 minutes by default), it removes each regular file in `.tmp/` that is named
+like a part, is not held by a live transaction, and was last written more than
+`staleAfterMs` (2 hours by default) before the host listed the directory. The
+server refuses to start unless `staleAfterMs` exceeds `transferDeadlineMs`.
 
 ## Running
 
 ```sh
 npm install
 npm test              # Elm laws and model tests, a differential test of the JS
-                      # interpreter against the Elm reference, then the real-disk suite
+                      # interpreter against the Elm reference, the real-disk
+                      # suite, then SIGKILL against the real process
 node upstream.js &    # the mock upstream on :3001
-npm start             # the server on :3000, data in ./data
+npm start             # the server on :3000, data in ./data (it creates
+                      # ./data/.tmp and ./data/blobs before it listens)
 npm run bench         # what carrying binary through Elm ports costs, by strategy
 ```
 

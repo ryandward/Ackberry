@@ -29,12 +29,12 @@ module Tx exposing
 ports race each other. So causality is not left to the runtime. It is data:
 
     begin
-        [ Do (Open lease tmp) [ Always (Close lease), OnFailure (Unlink tmp) ]
+        [ Do (Open lease part) [ Always (Close lease), OnFailure (Unlink part) ]
         , Do (PipeBody lease) []
         , Do (Sync lease) []
-        , Commit (Link tmp final)
-        , Do (Unlink tmp) []
-        , Do (SyncDir dir) []
+        , Commit (Link part final)
+        , Do (Unlink part) []
+        , Do (SyncDir finalDir) []
         ]
         Finish
 
@@ -61,7 +61,6 @@ Laws, which the bridge's interpreter must obey and `run` below defines:
 
 -}
 
-import Http.Request as Request exposing (RequestId)
 import Io exposing (HostError, Op)
 import Json.Decode as Decode exposing (Decoder)
 import Json.Encode as Encode
@@ -120,31 +119,34 @@ isAlways cleanup =
 -- INSTRUCTIONS
 
 
-encodeBegin : RequestId -> List Step -> Continuation -> Encode.Value
-encodeBegin request steps continuation =
+{-| `tx` is the transaction's name on the wire. The bridge treats it as an
+opaque key; whoever owns the transaction chooses it.
+-}
+encodeBegin : String -> List Step -> Continuation -> Encode.Value
+encodeBegin tx steps continuation =
     Encode.object
         [ ( "do", Encode.string "begin" )
-        , ( "tx", Encode.string (Request.idToString request) )
+        , ( "tx", Encode.string tx )
         , ( "steps", Encode.list encodeStep steps )
         , ( "then", encodeContinuation continuation )
         ]
 
 
-encodeExtend : RequestId -> List Step -> Continuation -> Encode.Value
-encodeExtend request steps continuation =
+encodeExtend : String -> List Step -> Continuation -> Encode.Value
+encodeExtend tx steps continuation =
     Encode.object
         [ ( "do", Encode.string "extend" )
-        , ( "tx", Encode.string (Request.idToString request) )
+        , ( "tx", Encode.string tx )
         , ( "steps", Encode.list encodeStep steps )
         , ( "then", encodeContinuation continuation )
         ]
 
 
-encodeAbort : RequestId -> Encode.Value
-encodeAbort request =
+encodeAbort : String -> Encode.Value
+encodeAbort tx =
     Encode.object
         [ ( "do", Encode.string "abort" )
-        , ( "tx", Encode.string (Request.idToString request) )
+        , ( "tx", Encode.string tx )
         ]
 
 

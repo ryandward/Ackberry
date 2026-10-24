@@ -105,9 +105,10 @@ diskFailure context error =
             fatal context error
 
 
-{-| A temp file that could not be removed is an orphan: it blocks its id
-with 409 until someone deletes it. It cannot be fixed from here, so it is
-reported, never dropped. ENOENT means it is already gone, which is the goal.
+{-| A part that could not be removed is an orphan. It blocks nothing, but
+it holds disk until the janitor gets it, and the failure that left it says
+something about the disk; so it is reported, never dropped. ENOENT means it
+is already gone, which is the goal.
 -}
 orphanUnlessGone : String -> HostError -> List Fault
 orphanUnlessGone path error =

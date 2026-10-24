@@ -11,6 +11,9 @@
 //   extend   append steps to a paused transaction
 //   abort    preempt a transaction
 //   log      write a fault line
+//   listen   start accepting connections (Elm sends it once the data
+//            directory's layout exists)
+//   halt     Elm refuses to serve; say why
 //
 // The interpreter knows sequencing, a cleanup stack and a commit flag; it
 // does not know what any operation means. The drivers know how to perform
@@ -20,7 +23,7 @@
 
 const http = require('node:http');
 const fs = require('node:fs/promises');
-const { constants: fsConstants, mkdirSync } = require('node:fs');
+const { constants: fsConstants } = require('node:fs');
 const path = require('node:path');
 const { createHash, randomUUID } = require('node:crypto');
 const { EventEmitter } = require('node:events');
@@ -211,6 +214,16 @@ function createInterpreter({ drivers, report, progress, reclaim, events }) {
 // ---------------------------------------------------------------------------
 // The drivers: one host primitive each.
 
+// fsync on a directory: makes its entries, not the files they name, durable.
+async function syncDirectory(dirPath) {
+  const dir = await fs.open(dirPath, 'r');
+  try {
+    await dir.sync();
+  } finally {
+    await dir.close();
+  }
+}
+
 function createDrivers({ handles, exchanges, knobs }) {
   // Fault injection for tests: a slow device. Deliberately not abortable,
   // because a slow syscall is not abortable either.
@@ -343,13 +356,51 @@ function createDrivers({ handles, exchanges, knobs }) {
       return {};
     }),
     syncDir: disk(async (op) => {
-      const dir = await fs.open(op.path, 'r');
-      try {
-        await dir.sync();
-      } finally {
-        await dir.close();
-      }
+      await syncDirectory(op.path);
       return {};
+    }),
+    // mkdir -p, durably: every directory it creates has its entry fsync'd
+    // in its parent. An existing directory is success; an existing anything
+    // else is EEXIST, a file in the way is ENOTDIR.
+    ensureDir: disk(async (op) => {
+      const created = await fs.mkdir(op.path, { recursive: true });
+      if (created === undefined) return { created: null };
+      const top = path.resolve(created);
+      for (let dir = path.resolve(op.path); ; dir = path.dirname(dir)) {
+        await syncDirectory(path.dirname(dir));
+        if (dir === top || path.dirname(dir) === dir) break;
+      }
+      return { created: top };
+    }),
+    // Every entry with its own lstat outcome, nothing filtered, and the host
+    // clock read before the directory was: an entry written during the
+    // listing has an mtime after `at`, never before.
+    listDir: disk(async (op) => {
+      const at = Date.now();
+      const entries = [];
+      for (const name of await fs.readdir(op.path)) {
+        try {
+          const stat = await fs.lstat(path.join(op.path, name));
+          entries.push({ name, stat: { ok: { isFile: stat.isFile(), mtimeMs: stat.mtimeMs } } });
+        } catch (err) {
+          entries.push({ name, stat: { error: hostError(err) } });
+        }
+      }
+      return { at, entries };
+    }),
+    // One unlink per path, each with its own outcome; a failure does not
+    // stop the rest.
+    unlinkEach: disk(async (op) => {
+      const outcomes = [];
+      for (const target of op.paths) {
+        try {
+          await fs.unlink(target);
+          outcomes.push({ ok: {} });
+        } catch (err) {
+          outcomes.push({ error: hostError(err) });
+        }
+      }
+      return { outcomes };
     }),
     httpGet,
     // The request body, read into memory: only for small bodies Elm must see.
@@ -415,11 +466,25 @@ function start({
   deliveryRate = { bytes: 8192, perMs: 2000 },
   jsonLimit = 1024 * 1024,
   uploadLimit = 4 * 1024 ** 3,
+  staleAfterMs = 2 * 3600 * 1000,
+  sweepEveryMs = 15 * 60 * 1000,
   diskLatencyMs = null,
   log = console.error,
 }) {
   const app = Elm.Main.init({
-    flags: { dataDir, upstream, deadlineMs, transferDeadlineMs, transferRate, deliveryRate, jsonLimit, uploadLimit, progressEveryMs: PROGRESS_EVERY_MS },
+    flags: {
+      dataDir,
+      upstream,
+      deadlineMs,
+      transferDeadlineMs,
+      transferRate,
+      deliveryRate,
+      jsonLimit,
+      uploadLimit,
+      progressEveryMs: PROGRESS_EVERY_MS,
+      staleAfterMs,
+      sweepEveryMs,
+    },
   });
   const exchanges = new Map(); // requestId -> { req, res }; the body is unread until a step reads it
   const handles = new Map(); // handle name -> fs.FileHandle
@@ -459,23 +524,6 @@ function start({
     ex.res.writeHead(status, headers).end(body);
   };
 
-  app.ports.toBridge.subscribe((instructions) => {
-    for (const instruction of instructions) {
-      switch (instruction.do) {
-        case 'respond': respond(instruction); break;
-        case 'begin': vm.begin(instruction); break;
-        case 'extend': vm.extend(instruction); break;
-        case 'abort': vm.abort(instruction); break;
-        case 'log':
-          events.emit('fault', instruction.fault);
-          log(JSON.stringify(instruction.fault));
-          break;
-        default:
-          throw new Error(`unknown instruction ${JSON.stringify(instruction.do)}: Elm and the bridge disagree on the protocol`);
-      }
-    }
-  });
-
   const onRequest = (req, res) => {
     const id = randomUUID();
     exchanges.set(id, { req, res });
@@ -496,7 +544,32 @@ function start({
   // Without this, Node answers "100 Continue" on Elm's behalf and the client
   // starts sending a body Elm may be about to refuse.
   server.on('checkContinue', onRequest);
-  server.listen(port);
+  // Elm's janitor keeps a timer while the server serves; this lets it go.
+  server.on('close', () => app.ports.serverClosed.send(null));
+
+  // Elm's init instructions arrive after this subscription, never before:
+  // its outgoing port manager starts with a zero-delay sleep.
+  app.ports.toBridge.subscribe((instructions) => {
+    for (const instruction of instructions) {
+      switch (instruction.do) {
+        case 'respond': respond(instruction); break;
+        case 'begin': vm.begin(instruction); break;
+        case 'extend': vm.extend(instruction); break;
+        case 'abort': vm.abort(instruction); break;
+        case 'log':
+          events.emit('fault', instruction.fault);
+          log(JSON.stringify(instruction.fault));
+          break;
+        case 'listen': server.listen(port); break;
+        case 'halt':
+          events.emit('halt', instruction.reason);
+          log(JSON.stringify({ event: 'halt', reason: instruction.reason }));
+          break;
+        default:
+          throw new Error(`unknown instruction ${JSON.stringify(instruction.do)}: Elm and the bridge disagree on the protocol`);
+      }
+    }
+  });
   return { server, exchanges, handles, txs: vm.txs, events, knobs };
 }
 
@@ -504,11 +577,12 @@ module.exports = { start, createInterpreter, hostError };
 
 if (require.main === module) {
   const dataDir = path.resolve(process.env.DATA_DIR ?? 'data');
-  mkdirSync(dataDir, { recursive: true });
-  const { server } = start({
+  const { server, events } = start({
     port: Number(process.env.PORT ?? 3000),
     dataDir,
     upstream: process.env.UPSTREAM ?? 'http://127.0.0.1:3001',
   });
   server.on('listening', () => console.log(`listening on http://localhost:${server.address().port}, data in ${dataDir}`));
+  // Nothing listens and no timer runs after a halt, so the process exits.
+  events.on('halt', () => { process.exitCode = 1; });
 }

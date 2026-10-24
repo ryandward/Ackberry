@@ -10,7 +10,6 @@ must produce, normalized for comparison.
 -}
 
 import Dict
-import Http.Request as Request
 import Io exposing (HostError)
 import Json.Decode as Decode exposing (Decoder)
 import Json.Encode as Encode
@@ -48,7 +47,7 @@ answer value =
         Ok p ->
             let
                 tx =
-                    Request.idFromString "tx"
+                    "tx"
 
                 lookup _ op =
                     Dict.get (labelOf op) p.outcomes |> Maybe.withDefault (Ok (Encode.object []))
