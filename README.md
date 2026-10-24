@@ -22,7 +22,7 @@ abort, and watches every streaming step through a rate meter.
 | `src/Commit.elm` | Create-only commit: `open(O_EXCL)` an anonymous part, write or stream, `fsync`, `link` it to the final name, `unlink` the part, `fsync` the final's directory |
 | `src/Http/` | Request and response types; a bidirectional route codec with round-trip laws |
 | `src/Io.elm`, `src/Verdict.elm` | Host primitives, host-error classification, and the failure tables that turn host errors into answers |
-| `server.js` | The bridge: HTTP front end, resource table, and the transaction interpreter |
+| `server.js` | The bridge: HTTP front end, resource table, the transaction interpreter, and the staged close |
 | `upstream.js` | A deliberately hostile mock upstream for `/delayed/:id` |
 
 ## Routes
@@ -35,6 +35,18 @@ abort, and watches every streaming step through a rate meter.
 | `POST /ingest/:id` | Commits a JSON object to `file_<id>.final`, create-only, returns its sha256 |
 | `PUT /blobs/:id` | Streams the body into an anonymous part and commits it to `blobs/<id>`, create-only |
 | `GET /blobs/:id` | Streams `blobs/<id>` back with an exact Content-Length |
+
+## Refusals
+
+A request refused before its body was read (413 from the headers, 400, 404,
+405, 408, 501) ends its connection. Closing at once loses answers: the client
+is still sending, the kernel answers its next bytes with a reset, and a client
+whose send fails that way can give up without reading the response already in
+its receive queue (RFC 9112 section 9.6). So the bridge closes in stages,
+within bounds Elm sets: it sends the response and a FIN, then reads and drops
+the client's bytes, never parsing them, until the client hangs up, 500 ms
+pass, or 128 KiB have been dropped. At most 64 connections linger at once;
+past that, the close is immediate. `/stats` counts how each one ended.
 
 ## Crashes
 

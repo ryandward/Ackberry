@@ -18,6 +18,7 @@ const autocannon = require('autocannon');
 const { start } = require('../server.js');
 const { startUpstream } = require('../upstream.js');
 
+const KiB = 1024;
 const MiB = 1024 * 1024;
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -123,6 +124,12 @@ async function main() {
   app.events.on('io', (e) => trail.push({ name: `${e.kind}:${e.phase}`, request: e.request, at: e.at }));
   app.events.on('tx', (e) => trail.push({ name: `tx:${e.phase}`, request: e.request, at: e.at }));
   app.events.on('disconnect', (d) => trail.push({ name: 'disconnect', request: d.request, at: d.at }));
+  const lingerings = [];
+  app.events.on('linger', (e) => lingerings.push(e));
+  const releaseOf = async (target) => {
+    await waitFor(`the release of ${target}`, () => lingerings.some((e) => e.request === idOf.get(target)));
+    return lingerings.find((e) => e.request === idOf.get(target));
+  };
   const of = (id) => trail.filter((e) => e.request === id);
   const first = (id, name) => of(id).find((e) => e.name === name);
   // A transaction's part is named after its request, never after the item.
@@ -131,7 +138,7 @@ async function main() {
   const quiescent = (timeoutMs = 5000) =>
     waitFor('quiescence', async () => {
       const s = await stats();
-      return s.inFlight === 0 && s.draining === 0 && app.txs.size === 0 && app.handles.size === 0 && app.exchanges.size === 0;
+      return s.inFlight === 0 && s.draining === 0 && app.txs.size === 0 && app.handles.size === 0 && app.exchanges.size === 0 && app.lingering.size === 0;
     }, timeoutMs);
 
   // The server created blobs/ and .tmp/ before it listened.
@@ -510,6 +517,124 @@ async function main() {
     assert.deepEqual(parts(), []);
   });
 
+  // STAGED CLOSE (RFC 9112 section 9.6) -------------------------------------
+
+  const refusal = (target) => `PUT ${target} HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: ${10 * 1024 ** 3}\r\n\r\n`;
+
+  await check('STAGED CLOSE: a client that reads its refusal and hangs up is let go at once', async () => {
+    const target = '/blobs/900';
+    const sock = net.connect(port, '127.0.0.1');
+    let response = '';
+    sock.on('data', (c) => { response += c.toString('latin1'); });
+    const closed = new Promise((resolve) => sock.on('close', resolve));
+    sock.write(refusal(target) + 'x'.repeat(64 * KiB));
+    await closed;
+    const e = await releaseOf(target);
+    assert.match(response, /^HTTP\/1\.1 413 /);
+    assert.deepEqual([e.how, e.discarded <= 64 * KiB], ['hungUp', true], `${e.how}, ${e.discarded} bytes discarded`);
+  });
+
+  await check('STAGED CLOSE: a client that keeps sending is cut once the 128 KiB budget is spent', async () => {
+    const target = '/blobs/901';
+    const sock = net.connect(port, '127.0.0.1');
+    sock.on('error', () => {});
+    const closed = new Promise((resolve) => sock.on('close', resolve));
+    sock.write(refusal(target));
+    const chunk = Buffer.alloc(64 * KiB, 0x41);
+    const next = () => { if (!sock.destroyed) sock.write(chunk, (err) => { if (!err) next(); }); };
+    next();
+    const e = await releaseOf(target);
+    await closed;
+    console.log(`    discarded ${e.discarded} bytes, then the fd was closed`);
+    assert.equal(e.how, 'budget');
+    assert.ok(e.discarded >= 128 * KiB && e.discarded < 192 * KiB, 'the budget, overshot by at most one read');
+  });
+
+  await check('STAGED CLOSE: 50 clients blasting at once are all drained; none is left unread until the deadline', async () => {
+    // Under this load Node's parser pauses many of these sockets for
+    // backpressure before the refusal goes out. A socket still paused when
+    // the staged close takes it over is never read again: its client is
+    // still sending, so only the deadline could end it.
+    const targets = Array.from({ length: 50 }, (_, i) => `/blobs/${910 + i}`);
+    const chunk = Buffer.alloc(64 * KiB, 0x41);
+    await Promise.all(targets.map((target) => {
+      const sock = net.connect(port, '127.0.0.1');
+      sock.on('error', () => {});
+      const closed = new Promise((resolve) => sock.on('close', resolve));
+      sock.write(refusal(target));
+      const next = () => { if (!sock.destroyed) sock.write(chunk, (err) => { if (!err) next(); }); };
+      next();
+      return closed;
+    }));
+    const releases = await Promise.all(targets.map(releaseOf));
+    const stalled = releases.filter((e) => e.how === 'deadline');
+    console.log(`    releases: ${[...new Set(releases.map((e) => e.how))].join(', ')}; discarded ${Math.min(...releases.map((e) => e.discarded))}-${Math.max(...releases.map((e) => e.discarded))} bytes each`);
+    assert.deepEqual(stalled.map((e) => e.discarded), [], 'sockets left unread until the deadline');
+  });
+
+  await check('STAGED CLOSE: a client that trickles and never hangs up is cut at the 500 ms deadline', async () => {
+    const target = '/blobs/902';
+    const sock = net.connect({ port, host: '127.0.0.1', allowHalfOpen: true });
+    sock.on('error', () => {});
+    let answered = null;
+    sock.on('data', () => { answered ??= process.hrtime.bigint(); });
+    const closed = new Promise((resolve) => sock.on('close', resolve));
+    sock.write(refusal(target));
+    const drip = setInterval(() => { if (!sock.destroyed) sock.write('x'); }, 50);
+    const e = await releaseOf(target);
+    clearInterval(drip);
+    sock.destroy();
+    await closed;
+    const held = ms(e.at - answered);
+    console.log(`    held ${held.toFixed(0)} ms after the 413 reached the client, ${e.discarded} bytes discarded`);
+    assert.equal(e.how, 'deadline');
+    assert.ok(held >= 450 && held < 1000);
+  });
+
+  await check('STAGED CLOSE: bytes sent after a refusal are dropped, never parsed as a request', async () => {
+    let parsed = 0;
+    const onRequest = (r) => { if (r.target === '/health?after-refusal') parsed += 1; };
+    app.events.on('request', onRequest);
+    const sock = net.connect({ port, host: '127.0.0.1', allowHalfOpen: true });
+    let response = '';
+    sock.on('data', (c) => { response += c.toString('latin1'); });
+    const closed = new Promise((resolve) => sock.on('close', resolve));
+    sock.write('POST /nope HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nabcd');
+    await waitFor('the 404', () => /\r\n\r\n/.test(response));
+    sock.end('GET /health?after-refusal HTTP/1.1\r\nHost: x\r\n\r\n');
+    await closed;
+    app.events.off('request', onRequest);
+    const e = await releaseOf('/nope');
+    assert.equal((response.match(/HTTP\/1\.1 \d{3} /g) ?? []).join(), 'HTTP/1.1 404 ');
+    assert.deepEqual([parsed, e.how], [0, 'hungUp']);
+  });
+
+  await check('STAGED CLOSE: never more than maxSockets lingering; past the cap the close is immediate', async () => {
+    const small = start({ port: 0, dataDir, upstream: upstreamUrl, linger: { deadlineMs: 600, maxBytes: 128 * KiB, maxSockets: 4 }, log: () => {} });
+    await listening(small.server);
+    const releases = [];
+    small.events.on('linger', (e) => releases.push(e.how));
+    let peak = 0;
+    const sampler = setInterval(() => { peak = Math.max(peak, small.lingering.size); }, 2);
+    await Promise.all(Array.from({ length: 10 }, (_, i) => {
+      const sock = net.connect({ port: small.server.address().port, host: '127.0.0.1', allowHalfOpen: true });
+      sock.on('error', () => {});
+      const closed = new Promise((resolve) => sock.on('close', resolve));
+      sock.write(refusal(`/blobs/${950 + i}`));
+      const drip = setInterval(() => { if (!sock.destroyed) sock.write('x'); }, 50);
+      return closed.then(() => clearInterval(drip));
+    }));
+    await waitFor('every release', () => releases.length === 10);
+    clearInterval(sampler);
+    const s = json(await send(small.server.address().port, { path: '/stats' }));
+    small.server.close();
+    const counts = releases.reduce((acc, how) => ({ ...acc, [how]: (acc[how] ?? 0) + 1 }), {});
+    console.log(`    peak ${peak} lingering; releases ${JSON.stringify(counts)}`);
+    assert.equal(peak, 4);
+    assert.deepEqual(counts, { deadline: 4, poolFull: 6 });
+    assert.deepEqual([s.lingered.deadlinePassed, s.lingered.poolFull], [4, 6]);
+  });
+
   // UNRECOGNIZED HOST ERRORS -------------------------------------------------
 
   await check('ELOOP on a blob is a fatal 500 with a logged fault, never a 404', async () => {
@@ -658,6 +783,14 @@ async function main() {
     assert.equal(s.received, s.responded + s.abandoned);
     assert.deepEqual(parts(), []);
     assert.deepEqual([...new Set(faults.map((f) => f.event))].sort(), ['orphan', 'unclassified'], JSON.stringify(faults));
+    const released = (how) => lingerings.filter((e) => e.how === how).length;
+    assert.deepEqual(s.lingered, {
+      hungUp: released('hungUp'),
+      deadlinePassed: released('deadline'),
+      budgetSpent: released('budget'),
+      poolFull: released('poolFull'),
+      bytesDiscarded: lingerings.reduce((n, e) => n + e.discarded, 0),
+    }, 'Elm counted every release the bridge reported');
     assert.ok(openFds() <= baselineFds, `fds: ${openFds()} now, ${baselineFds} at start`);
   });
 

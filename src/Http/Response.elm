@@ -1,6 +1,7 @@
 module Http.Response exposing
     ( Connection(..)
     , Failure(..)
+    , Linger
     , Response
     , Wire
     , created
@@ -59,13 +60,36 @@ type Failure
     | InsufficientStorage
 
 
-{-| `CloseAfter` when the request declared a body that was never fully
-read. Otherwise Node would keep the connection alive by reading and
-discarding the rest of that body, at whatever speed the client chooses.
+{-| What becomes of the connection after the response.
+
+`KeepAlive` when the request had no body, or its body was read to the end.
+
+`CloseAfter` when the request declared a body that was never fully read.
+Keeping the connection would make Node read and discard the rest of that
+body at whatever speed the client chooses. Closing it at once is no better:
+the client is still sending, the kernel answers its next bytes with a reset,
+and a client whose send fails that way can give up without reading the
+response already waiting for it (RFC 9112 section 9.6). So the bridge closes
+in stages, within the `Linger` bounds.
+
 -}
 type Connection
     = KeepAlive
-    | CloseAfter
+    | CloseAfter Linger
+
+
+{-| The staged close: the response, then FIN, then the client's bytes are
+read and dropped, never parsed, until the client hangs up, `deadlineMs`
+pass, or `maxBytes` have been dropped, and then the fd is closed. If
+`maxSockets` connections are lingering already, the close is immediate:
+the server's fds come before a clean answer to a client that ignored
+`Expect`.
+-}
+type alias Linger =
+    { deadlineMs : Int
+    , maxBytes : Int
+    , maxSockets : Int
+    }
 
 
 ok : Encode.Value -> Response
@@ -217,14 +241,16 @@ failureTitle failure =
             "Insufficient Storage"
 
 
-{-| What the bridge feeds to `res.writeHead(status, headers).end(body)`.
-`headers` is flat `[name, value, name, value, ...]`, the raw form writeHead
-accepts, so the bridge never iterates or rewrites anything.
+{-| What the bridge feeds to `res.writeHead(status, headers).end(body)`,
+and how it ends the connection afterwards. `headers` is flat
+`[name, value, name, value, ...]`, the raw form writeHead accepts, so the
+bridge never iterates or rewrites anything.
 -}
 type alias Wire =
     { status : Int
     , headers : List String
     , body : String
+    , linger : Maybe Linger
     }
 
 
@@ -238,8 +264,8 @@ toWire connection response =
         KeepAlive ->
             wire
 
-        CloseAfter ->
-            { wire | headers = wire.headers ++ [ "connection", "close" ] }
+        CloseAfter linger ->
+            { wire | headers = wire.headers ++ [ "connection", "close" ], linger = Just linger }
 
 
 render : Response -> Wire
@@ -269,6 +295,7 @@ render response =
 
                     NoOctets ->
                         ""
+            , linger = Nothing
             }
 
         Problem failure detail extensions ->
@@ -288,6 +315,7 @@ render response =
                                , ( "detail", Encode.string detail )
                                ]
                         )
+            , linger = Nothing
             }
 
 

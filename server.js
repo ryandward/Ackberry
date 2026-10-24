@@ -6,7 +6,8 @@
 // It decides nothing. Elm sends one ordered array of instructions per update
 // and the bridge applies them in order:
 //
-//   respond  write an inline response
+//   respond  write an inline response; if Elm attached a linger, close the
+//            connection in stages within its bounds
 //   begin    start a transaction: an ordered list of steps
 //   extend   append steps to a paused transaction
 //   abort    preempt a transaction
@@ -22,6 +23,7 @@
 // Elm's reference semantics on random programs.
 
 const http = require('node:http');
+const net = require('node:net');
 const fs = require('node:fs/promises');
 const { constants: fsConstants } = require('node:fs');
 const path = require('node:path');
@@ -455,6 +457,82 @@ function createDrivers({ handles, exchanges, knobs }) {
 }
 
 // ---------------------------------------------------------------------------
+// The staged close of RFC 9112 section 9.6, for a response that ends a
+// connection whose request body was never read.
+//
+// Node closes such a connection as soon as the response is flushed, and
+// that loses answers: the client is still sending, the kernel answers its
+// next bytes with a reset, and a client whose send fails that way can give
+// up without reading the response already in its receive queue. So the
+// close happens in stages: the response, then FIN, then the client's bytes
+// are read and dropped, never parsed, until it hangs up or one of Elm's
+// bounds is crossed (a deadline, a byte budget), and only then is the fd
+// closed. Elm also caps how many connections may linger at once; past the
+// cap the close is immediate. The bridge decides none of it: it counts,
+// compares with Elm's numbers, and reports how each connection ended once
+// its fd is closed.
+
+function createLinger({ released }) {
+  const lingering = new Set();
+  const install = (socket, request, bound) => {
+    let staged = false;
+    // Node's HTTP server calls socket.destroySoon() once a response that
+    // carried "connection: close" has been flushed. This replaces it, for
+    // this one socket.
+    socket.destroySoon = function stagedClose() {
+      if (staged) return;
+      staged = true;
+      if (this.closed) {
+        released(request, 'hungUp', 0);
+        return;
+      }
+      if (this.destroyed) {
+        this.once('close', () => released(request, 'hungUp', 0));
+        return;
+      }
+      if (lingering.size >= bound.maxSockets) {
+        this.once('close', () => released(request, 'poolFull', 0));
+        net.Socket.prototype.destroySoon.call(this);
+        return;
+      }
+      lingering.add(this);
+      let discarded = 0;
+      let how = 'hungUp';
+      const cut = (why) => {
+        if (this.destroyed) return;
+        how = why;
+        this.destroy();
+      };
+      const deadline = setTimeout(() => cut('deadline'), bound.deadlineMs);
+      this.once('close', () => {
+        clearTimeout(deadline);
+        lingering.delete(this);
+        released(request, how, discarded);
+      });
+      // The client's bytes are no longer a request: take them from the HTTP
+      // parser and drop them. Adding a 'data' listener also takes the
+      // socket back from the parser's native fast path, and with it the
+      // parser's pause and resume handlers; a socket the parser had paused
+      // for backpressure would then never read again, so restart its handle
+      // the way Node's own resume handler does.
+      this.removeAllListeners('data');
+      this.on('data', (chunk) => {
+        discarded += chunk.length;
+        if (discarded >= bound.maxBytes) cut('budget');
+      });
+      this.once('end', () => cut('hungUp'));
+      this.end();
+      this.resume();
+      if (this._handle && !this._handle.reading) {
+        this._handle.reading = true;
+        this._handle.readStart();
+      }
+    };
+  };
+  return { lingering, install };
+}
+
+// ---------------------------------------------------------------------------
 
 function start({
   port,
@@ -468,6 +546,7 @@ function start({
   uploadLimit = 4 * 1024 ** 3,
   staleAfterMs = 2 * 3600 * 1000,
   sweepEveryMs = 15 * 60 * 1000,
+  linger = { deadlineMs: 500, maxBytes: 128 * 1024, maxSockets: 64 },
   diskLatencyMs = null,
   log = console.error,
 }) {
@@ -484,9 +563,13 @@ function start({
       progressEveryMs: PROGRESS_EVERY_MS,
       staleAfterMs,
       sweepEveryMs,
+      linger,
     },
   });
-  const exchanges = new Map(); // requestId -> { req, res }; the body is unread until a step reads it
+  // requestId -> { req, res, socket }; the body is unread until a step reads
+  // it. The socket is kept apart because a step that pipes the body detaches
+  // req from it when it is severed, and the staged close still needs it.
+  const exchanges = new Map();
   const handles = new Map(); // handle name -> fs.FileHandle
   const events = new EventEmitter(); // observation only; nothing here reads it
   const knobs = { diskLatencyMs };
@@ -515,18 +598,26 @@ function start({
     events,
   });
 
+  const lingers = createLinger({
+    released: (request, how, discarded) => {
+      events.emit('linger', { request, how, discarded, at: now() });
+      app.ports.connectionReleased.send([request, { how, discarded }]);
+    },
+  });
+
   // A miss is legitimate: the client can leave while the instruction sits in
   // Elm's port mailbox. Ids are never reused, so nothing else can be hit.
-  const respond = ({ request, status, headers, body }) => {
+  const respond = ({ request, status, headers, body, linger }) => {
     const ex = exchanges.get(request);
     if (ex === undefined) return;
     exchanges.delete(request);
+    if (linger !== null) lingers.install(ex.socket, request, linger);
     ex.res.writeHead(status, headers).end(body);
   };
 
   const onRequest = (req, res) => {
     const id = randomUUID();
-    exchanges.set(id, { req, res });
+    exchanges.set(id, { req, res, socket: req.socket });
     // Not req 'close': since Node 16 it fires once the body has been read.
     // res 'close' fires when the response finished or the connection died;
     // only a death leaves the id in the map.
@@ -570,7 +661,7 @@ function start({
       }
     }
   });
-  return { server, exchanges, handles, txs: vm.txs, events, knobs };
+  return { server, exchanges, handles, txs: vm.txs, lingering: lingers.lingering, events, knobs };
 }
 
 module.exports = { start, createInterpreter, hostError };

@@ -6,6 +6,7 @@ module Server exposing
     , Effect(..)
     , Job
     , Ledger
+    , Lingered
     , Meter
     , Model
     , Msg(..)
@@ -89,6 +90,7 @@ type alias Config =
     , progressEveryMs : Int
     , staleAfterMs : Int
     , sweepEveryMs : Int
+    , linger : Response.Linger
     }
 
 
@@ -198,6 +200,21 @@ type alias Ledger =
     , faults : Int
     , orphans : Int
     , swept : Int
+    , lingered : Lingered
+    }
+
+
+{-| How connections refused with an unread body ended (see
+`Response.Linger`): the client hung up before any bound was crossed, or the
+deadline or the byte budget cut it, or the pool was full and the close was
+immediate. And how many bytes the bridge read and dropped for them.
+-}
+type alias Lingered =
+    { hungUp : Int
+    , deadlinePassed : Int
+    , budgetSpent : Int
+    , poolFull : Int
+    , bytesDiscarded : Int
     }
 
 
@@ -205,7 +222,9 @@ type alias Ledger =
 every beat; `Progressed` carries the bridge's clock at the moment it took the
 count, so a count and its index are written together (L-spec Corollary
 16.2). All are milliseconds since the epoch. `SweepDue` is the janitor's
-alarm and `Closed` is the bridge's server shutting down.
+alarm and `Closed` is the bridge's server shutting down. `Released` comes
+once per refused connection, after its fd is closed, and is only counted:
+that connection is no longer anything the server decides about.
 -}
 type Msg
     = Received RequestId Int Decode.Value
@@ -215,6 +234,7 @@ type Msg
     | Tick Int
     | SweepDue
     | Closed
+    | Released RequestId Decode.Value
 
 
 {-| Each becomes one entry in the single ordered instruction array `Main`
@@ -292,6 +312,7 @@ init config =
                 , faults = 0
                 , orphans = 0
                 , swept = 0
+                , lingered = { hungUp = 0, deadlinePassed = 0, budgetSpent = 0, poolFull = 0, bytesDiscarded = 0 }
                 }
             }
     in
@@ -310,6 +331,9 @@ misconfigured config =
 
     else if config.sweepEveryMs <= 0 then
         Just "sweepEveryMs must be positive"
+
+    else if config.linger.deadlineMs < 0 || config.linger.maxBytes < 0 || config.linger.maxSockets < 0 then
+        Just "the linger bounds must not be negative"
 
     else
         Nothing
@@ -366,6 +390,14 @@ step msg model =
 
         Closed ->
             ( { model | phase = Stopped }, [] )
+
+        Released id value ->
+            case Decode.decodeValue releaseDecoder value of
+                Ok ( how, bytes ) ->
+                    ( count (\l -> { l | lingered = tally how bytes l.lingered }) model, [] )
+
+                Err error ->
+                    report (Exchange id) [ Anomaly ("a connection release that does not decode: " ++ Decode.errorToString error) ] model
 
         Progressed id bytes running at ->
             withJob id model <|
@@ -457,7 +489,7 @@ expire id model =
                 ( model
                     |> putJob id { job | client = Answered }
                     |> count (\l -> { l | responded = l.responded + 1, timedOut = l.timedOut + 1, aborted = l.aborted + 1 })
-                , [ Respond id response (connection job.body), Abort id ]
+                , [ Respond id response (connection model.config.linger job.body), Abort id ]
                 )
 
             else
@@ -523,7 +555,7 @@ tooSlow id job meter model =
                         ("the body arrived slower than " ++ String.fromInt meter.rate.bytes ++ " bytes per " ++ String.fromInt meter.rate.perMs ++ " ms")
                         [ ( "bytesReceived", Encode.int meter.moved ) ]
                     )
-                    (connection job.body)
+                    (connection model.config.linger job.body)
               , Abort id
               ]
             )
@@ -608,7 +640,7 @@ conclude id job reply faults model =
                             report (Exchange id) [ Anomaly "a transaction settled without answering its client" ] afterAnswer
                     in
                     ( count (\l -> { l | responded = l.responded + 1 }) m
-                    , fx ++ [ Respond id (Response.problem Response.InternalServerError "the request ended without an answer" []) (connection answered.body) ]
+                    , fx ++ [ Respond id (Response.problem Response.InternalServerError "the request ended without an answer" []) (connection model.config.linger answered.body) ]
                     )
 
                 Answered ->
@@ -632,7 +664,7 @@ applyAnswer id answer job model =
         ( Inline response, Waiting ) ->
             ( { job | client = Answered }
             , count (\l -> { l | responded = l.responded + 1 }) model
-            , [ Respond id response (connection job.body) ]
+            , [ Respond id response (connection model.config.linger job.body) ]
             )
 
         ( ByStream, Waiting ) ->
@@ -655,11 +687,11 @@ applyAnswer id answer job model =
             ( job, model, [] )
 
 
-connection : BodyState -> Response.Connection
-connection body =
+connection : Response.Linger -> BodyState -> Response.Connection
+connection linger body =
     case body of
         Unread ->
-            Response.CloseAfter
+            Response.CloseAfter linger
 
         NoBody ->
             Response.KeepAlive
@@ -1091,7 +1123,7 @@ begin id body outcome model =
 answerNow : RequestId -> BodyState -> Response -> Model -> ( Model, List Effect )
 answerNow id body response model =
     ( count (\l -> { l | responded = l.responded + 1 }) model
-    , [ Respond id response (connection body) ]
+    , [ Respond id response (connection model.config.linger body) ]
     )
 
 
@@ -1642,6 +1674,63 @@ heldPart job =
 
 
 
+-- LINGERING CONNECTIONS
+
+
+type Release
+    = HungUp
+    | DeadlinePassed
+    | BudgetSpent
+    | PoolFull
+
+
+releaseDecoder : Decode.Decoder ( Release, Int )
+releaseDecoder =
+    Decode.map2 Tuple.pair
+        (Decode.field "how" Decode.string
+            |> Decode.andThen
+                (\how ->
+                    case how of
+                        "hungUp" ->
+                            Decode.succeed HungUp
+
+                        "deadline" ->
+                            Decode.succeed DeadlinePassed
+
+                        "budget" ->
+                            Decode.succeed BudgetSpent
+
+                        "poolFull" ->
+                            Decode.succeed PoolFull
+
+                        _ ->
+                            Decode.fail ("no such release: " ++ how)
+                )
+        )
+        (Decode.field "discarded" Decode.int)
+
+
+tally : Release -> Int -> Lingered -> Lingered
+tally how bytes lingered =
+    let
+        counted =
+            { lingered | bytesDiscarded = lingered.bytesDiscarded + bytes }
+    in
+    case how of
+        HungUp ->
+            { counted | hungUp = counted.hungUp + 1 }
+
+        DeadlinePassed ->
+            { counted | deadlinePassed = counted.deadlinePassed + 1 }
+
+        BudgetSpent ->
+            { counted | budgetSpent = counted.budgetSpent + 1 }
+
+        PoolFull ->
+            { counted | poolFull = counted.poolFull + 1 }
+
+
+
 -- BOOKKEEPING
 
 
@@ -1720,6 +1809,15 @@ encodeStats model =
         , ( "faults", Encode.int l.faults )
         , ( "orphans", Encode.int l.orphans )
         , ( "swept", Encode.int l.swept )
+        , ( "lingered"
+          , Encode.object
+                [ ( "hungUp", Encode.int l.lingered.hungUp )
+                , ( "deadlinePassed", Encode.int l.lingered.deadlinePassed )
+                , ( "budgetSpent", Encode.int l.lingered.budgetSpent )
+                , ( "poolFull", Encode.int l.lingered.poolFull )
+                , ( "bytesDiscarded", Encode.int l.lingered.bytesDiscarded )
+                ]
+          )
         , ( "inFlight", Encode.int waiting )
         , ( "draining", Encode.int (List.length jobs - waiting) )
         ]

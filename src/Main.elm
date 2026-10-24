@@ -40,6 +40,9 @@ port txProgress : ({ request : String, bytes : Int, running : Bool, at : Int } -
 port serverClosed : (() -> msg) -> Sub msg
 
 
+port connectionReleased : (( String, Decode.Value ) -> msg) -> Sub msg
+
+
 port toBridge : List Encode.Value -> Cmd msg
 
 
@@ -68,6 +71,7 @@ main =
                     , txReported (\( tx, value ) -> Server.Reported (Server.ownerFromKey tx) value)
                     , txProgress (\p -> Server.Progressed (Request.idFromString p.request) p.bytes p.running p.at)
                     , serverClosed (\() -> Server.Closed)
+                    , connectionReleased (\( id, value ) -> Server.Released (Request.idFromString id) value)
 
                     -- The clocks run only while something needs them.
                     , if Dict.isEmpty model.jobs then
@@ -114,6 +118,18 @@ instruction effect =
                     , ( "status", Encode.int wire.status )
                     , ( "headers", Encode.list Encode.string wire.headers )
                     , ( "body", Encode.string wire.body )
+                    , ( "linger"
+                      , case wire.linger of
+                            Just linger ->
+                                Encode.object
+                                    [ ( "deadlineMs", Encode.int linger.deadlineMs )
+                                    , ( "maxBytes", Encode.int linger.maxBytes )
+                                    , ( "maxSockets", Encode.int linger.maxSockets )
+                                    ]
+
+                            Nothing ->
+                                Encode.null
+                      )
                     ]
                 )
 

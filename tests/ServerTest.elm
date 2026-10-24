@@ -33,6 +33,7 @@ config =
     , progressEveryMs = 100
     , staleAfterMs = 7200000
     , sweepEveryMs = 900000
+    , linger = { deadlineMs = 500, maxBytes = 131072, maxSockets = 64 }
     }
 
 
@@ -582,7 +583,7 @@ suite =
                     arrive "PUT" "/blobs/9" [ ( "Content-Length", "10737418240" ) ]
                         |> Expect.all
                             [ one (statusIs 413)
-                            , answers >> List.map Tuple.second >> Expect.equal [ Response.CloseAfter ]
+                            , answers >> List.map Tuple.second >> Expect.equal [ Response.CloseAfter config.linger ]
                             , kinds >> Expect.equal [ "respond" ]
                             ]
             , test "the client leaves mid-body: abort, the pipe is severed, unlink then close, no answer" <|
@@ -609,7 +610,7 @@ suite =
                         |> Expect.all
                             [ kinds >> Expect.equal [ "begin", "respond", "abort" ]
                             , one (statusIs 408)
-                            , answers >> List.map Tuple.second >> Expect.equal [ Response.CloseAfter ]
+                            , answers >> List.map Tuple.second >> Expect.equal [ Response.CloseAfter config.linger ]
                             , names >> Expect.equal [ "open /d/.tmp/a.part", "pipe-body", "unlink /d/.tmp/a.part", "close" ]
                             , \sim -> Expect.equal 1 sim.model.ledger.tooSlow
                             , settled
@@ -751,7 +752,7 @@ suite =
                     arrive "POST" "/nope" (withBody "xxxx")
                         |> answers
                         |> List.map (\( w, c ) -> ( w.status, c ))
-                        |> Expect.equal [ ( 404, Response.CloseAfter ) ]
+                        |> Expect.equal [ ( 404, Response.CloseAfter config.linger ) ]
             , test "a slow JSON body is answered 408 by the meter" <|
                 \_ ->
                     arrive "POST" "/echo" (withBody payload)
@@ -772,6 +773,42 @@ suite =
                         ( arrive "PURGE" "/health" [] |> answers |> List.map (Tuple.first >> .status)
                         , arrive "PUT" "/health" [] |> answers |> List.map (Tuple.first >> .status)
                         )
+            ]
+        , describe "refused connections"
+            [ test "a release is counted and decides nothing" <|
+                \_ ->
+                    arrive "GET" "/health" []
+                        |> feed (Released a (Encode.object [ ( "how", Encode.string "budget" ), ( "discarded", Encode.int 196608 ) ]))
+                        |> feed (Released a (Encode.object [ ( "how", Encode.string "hungUp" ), ( "discarded", Encode.int 1000 ) ]))
+                        |> feed (Released a (Encode.object [ ( "how", Encode.string "poolFull" ), ( "discarded", Encode.int 0 ) ]))
+                        |> Expect.all
+                            [ \sim ->
+                                Expect.equal { hungUp = 1, deadlinePassed = 0, budgetSpent = 1, poolFull = 1, bytesDiscarded = 197608 }
+                                    sim.model.ledger.lingered
+                            , kinds >> Expect.equal [ "respond" ]
+                            ]
+            , test "a release that does not decode is an anomaly, not a guess" <|
+                \_ ->
+                    arrive "GET" "/health" []
+                        |> feed (Released a (Encode.object [ ( "how", Encode.string "evaporated" ), ( "discarded", Encode.int 0 ) ]))
+                        |> Expect.all
+                            [ faults >> List.length >> Expect.equal 1
+                            , \sim -> Expect.equal 0 sim.model.ledger.lingered.hungUp
+                            ]
+            , test "negative linger bounds refuse to start" <|
+                \_ ->
+                    Server.init { config | linger = { deadlineMs = 500, maxBytes = -1, maxSockets = 64 } }
+                        |> Tuple.second
+                        |> List.map
+                            (\effect ->
+                                case effect of
+                                    Halt _ ->
+                                        "halt"
+
+                                    _ ->
+                                        "other"
+                            )
+                        |> Expect.equal [ "halt" ]
             ]
         , describe "the janitor"
             [ test "the server opens only once its layout exists: prepare, then Listen and a survey" <|

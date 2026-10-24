@@ -47,6 +47,7 @@ config =
     , progressEveryMs = 100
     , staleAfterMs = 5000
     , sweepEveryMs = 1000
+    , linger = { deadlineMs = 500, maxBytes = 131072, maxSockets = 64 }
     }
 
 
@@ -753,7 +754,7 @@ judgeEmission jobsBefore effect world =
                 wire =
                     Response.toWire connection response
             in
-            if unread && connection /= Response.CloseAfter then
+            if unread && connection == Response.KeepAlive then
                 violate (key ++ " answered while its body was unread, without closing the connection") queued
 
             else if wire.status == 408 && Set.member key world.drained then
