@@ -1,12 +1,14 @@
 # Ackberry
 
 A headless HTTP server in which every decision is made in pure Elm 0.19.1. Node
-is reduced to a socket front end and an interpreter for a small transaction
-algebra; it routes nothing, chooses no status codes, and never decides what an
-error means.
+is reduced to raw TCP sockets (`node:net`, not `node:http`) and an interpreter
+for a small transaction algebra; it parses nothing it could decide, routes
+nothing, chooses no status codes, keeps no deadlines of its own, and never
+decides what an error means. Elm parses every request head and writes every
+byte of every response. Why `node:http` had to go is in `ARCHITECTURE.md`.
 
-Request bodies are never buffered on Elm's behalf. A request reaches Elm when its
-headers are parsed; its body stays on the socket until a transaction step reads
+Request bodies are never buffered on Elm's behalf. A request reaches Elm as the
+bytes of its head; its body stays on the socket until a transaction step reads
 it into memory (small JSON bodies, under a limit Elm sets) or pipes it straight
 to a leased file on disk. Elm holds every transaction as a capability it can
 abort, and watches every streaming step through a rate meter.
@@ -17,12 +19,16 @@ abort, and watches every streaming step through a rate meter.
 | --- | --- |
 | `src/Tx.elm` | The transaction algebra (`Do op cleanups`, `Commit op`, `Always`/`OnFailure` cleanups, `Pause`/`Finish`, abort), its seven laws, and a pure reference interpreter |
 | `src/Plan.elm` | Typestate builder: the only way the server can construct a transaction. A lease without its cleanups, a commit before fsync, or a write into an unleased file does not compile |
-| `src/Server.elm` | The router as a pure state machine. Deadlines and rate meters are data, checked by a clock subscription that exists only while jobs do. Also the janitor, which prepares the data directory before the server listens and collects the parts crashed processes leave |
+| `src/Server.elm` | The server as a pure state machine: connections, exchanges, routing, deadlines and rate meters as data, checked against the bridge's clock. Also the janitor, which prepares the data directory before the server listens and collects the parts crashed processes leave |
+| `src/Kernel.elm` | How a connection whose body was never read is closed, and the pool of connections that may linger while they are |
 | `src/Layout.elm` | Every path the server touches. In-flight bytes live in `.tmp/<transaction>.part`, named after the transaction and never after the resource it will become |
 | `src/Commit.elm` | Create-only commit: `open(O_EXCL)` an anonymous part, write or stream, `fsync`, `link` it to the final name, `unlink` the part, `fsync` the final's directory |
-| `src/Http/` | Request and response types; a bidirectional route codec with round-trip laws |
+| `src/Http/Head.elm` | The request head under RFC 9112: request line, fields, `Host`, framing, persistence, `Expect`, every refusal named |
+| `src/Http/Response.elm`, `src/Http/Date.elm` | Responses, serialized byte for byte: `Content-Length` in UTF-8 bytes, an IMF-fixdate `Date`, `100 Continue` |
+| `src/Http/Chunked.elm` | The chunked coding's reference semantics, which the bridge's decoder must match byte for byte |
+| `src/Http/Request.elm`, `src/Http/Route.elm` | Requests, connection and request ids; a bidirectional route codec with round-trip laws |
 | `src/Io.elm`, `src/Verdict.elm` | Host primitives, host-error classification, and the failure tables that turn host errors into answers |
-| `server.js` | The bridge: HTTP front end, resource table, the transaction interpreter, and the staged close |
+| `server.js` | The bridge: sockets, head delimiting, the chunked decoder, the resource table, the transaction interpreter, and the staged close |
 | `upstream.js` | A deliberately hostile mock upstream for `/delayed/:id` |
 
 ## Routes
@@ -36,10 +42,31 @@ abort, and watches every streaming step through a rate meter.
 | `PUT /blobs/:id` | Streams the body into an anonymous part and commits it to `blobs/<id>`, create-only |
 | `GET /blobs/:id` | Streams `blobs/<id>` back with an exact Content-Length |
 
+## Connections
+
+A connection carries one exchange at a time. Its first head must arrive
+within `headDeadlineMs` (10 s) of the accept, or Elm answers 408 and closes;
+between requests it may sit idle for `idleMs` (5 s), after which it is closed
+without a word. A connection persists after a response only if the request's
+body was read to its end, the client did not ask to close, the client has not
+ended its side, and the server is still serving. Requests are numbered on
+their connection (`<connection>.<n>`), and pipelined requests wait on the
+socket, unparsed, until Elm has answered the one before.
+
+Every deadline is Elm's, on the monotonic clock the bridge stamps on each
+event; Elm keeps no timers and asks for one alarm at a time.
+
+A head the bridge cannot delimit within `maxHeadBytes` (16 KiB) is 431. A
+head Elm refuses is answered and the connection closed: 400 for a malformed
+line or field, a missing, repeated or invalid `Host`, or body framing that is
+ambiguous or malformed; 414 for a long target; 417 for an expectation other than
+`100-continue`; 501 for an unknown method or transfer coding; 505 for a
+major version other than 1.
+
 ## Refusals
 
 A request refused before its body was read (413 from the headers, 400, 404,
-405, 408, 501) ends its connection. Closing at once loses answers: the client
+405, 408, 414, 417, 431, 501, 505) ends its connection. Closing at once loses answers: the client
 is still sending, the kernel answers its next bytes with a reset, and a client
 whose send fails that way can give up without reading the response already in
 its receive queue (RFC 9112 section 9.6). So the bridge closes in stages,
@@ -72,9 +99,10 @@ server refuses to start unless `staleAfterMs` exceeds `transferDeadlineMs`.
 
 ```sh
 npm install
-npm test              # Elm laws and model tests, a differential test of the JS
-                      # interpreter against the Elm reference, the real-disk
-                      # suite, then SIGKILL against the real process
+npm test              # Elm laws and model tests, differential tests of the JS
+                      # interpreter and the JS chunked decoder against their
+                      # Elm references, the real-disk suite, then SIGKILL
+                      # against the real process
 node upstream.js &    # the mock upstream on :3001
 npm start             # the server on :3000, data in ./data (it creates
                       # ./data/.tmp and ./data/blobs before it listens)
