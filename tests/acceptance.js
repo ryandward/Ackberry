@@ -12,7 +12,7 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
-const { createHash, randomBytes } = require('node:crypto');
+const { createHash, randomBytes, randomUUID } = require('node:crypto');
 const { Readable } = require('node:stream');
 const autocannon = require('autocannon');
 const { start } = require('../server.js');
@@ -111,7 +111,9 @@ async function main() {
   const post = (target, body) => send(port, { method: 'POST', path: target, body });
   const stats = async () => json(await get('/stats'));
   const files = () => fs.readdirSync(dataDir);
-  const tmpFiles = () => files().filter((f) => f.endsWith('.tmp'));
+  const parts = () => fs.readdirSync(path.join(dataDir, '.tmp'));
+  const blobs = () => fs.readdirSync(path.join(dataDir, 'blobs'));
+  const blobPath = (id) => path.join(dataDir, 'blobs', String(id));
 
   const faults = [];
   const trail = [];
@@ -123,6 +125,8 @@ async function main() {
   app.events.on('disconnect', (d) => trail.push({ name: 'disconnect', request: d.request, at: d.at }));
   const of = (id) => trail.filter((e) => e.request === id);
   const first = (id, name) => of(id).find((e) => e.name === name);
+  // A transaction's part is named after its request, never after the item.
+  const partOf = (target) => path.join(dataDir, '.tmp', `${idOf.get(target)}.part`);
 
   const quiescent = (timeoutMs = 5000) =>
     waitFor('quiescence', async () => {
@@ -130,12 +134,13 @@ async function main() {
       return s.inFlight === 0 && s.draining === 0 && app.txs.size === 0 && app.handles.size === 0 && app.exchanges.size === 0;
     }, timeoutMs);
 
+  // The server created blobs/ and .tmp/ before it listened.
   const blob = randomBytes(10 * MiB);
-  fs.writeFileSync(path.join(dataDir, 'blob_1.bin'), blob);
-  fs.writeFileSync(path.join(dataDir, 'blob_3.bin'), '');
-  fs.mkdirSync(path.join(dataDir, 'blob_4.bin'));
-  execFileSync('mkfifo', [path.join(dataDir, 'blob_7.bin')]);
-  fs.symlinkSync('blob_9.bin', path.join(dataDir, 'blob_9.bin'));
+  fs.writeFileSync(blobPath(1), blob);
+  fs.writeFileSync(blobPath(3), '');
+  fs.mkdirSync(blobPath(4));
+  execFileSync('mkfifo', [blobPath(7)]);
+  fs.symlinkSync('9', blobPath(9));
   const baselineFds = openFds();
 
   // PHASE 1 ----------------------------------------------------------------
@@ -175,7 +180,7 @@ async function main() {
     assert.deepEqual(json(r), { itemId: 42, bytes: Buffer.byteLength(body), sha256: sha256(body) });
     assert.equal(fs.readFileSync(path.join(dataDir, 'file_42.final'), 'utf8'), body);
     assert.equal((await post('/ingest/42', '{"again":1}')).status, 409);
-    assert.deepEqual(tmpFiles(), []);
+    assert.deepEqual(parts(), []);
   });
 
   await check('POISON DISK: chmod 000 -> ingest 500 {EACCES, open}, blob 500 not 404, nothing pending', async () => {
@@ -208,9 +213,9 @@ async function main() {
     }
     assert.deepEqual([r.status, json(r).hostError], [500, { code: 'EACCES', syscall: 'link' }]);
     const orphan = faults.find((f) => f.event === 'orphan');
-    assert.equal(orphan?.path, path.join(dataDir, 'file_44.tmp'));
-    assert.deepEqual(tmpFiles(), ['file_44.tmp'], 'the reported orphan is the only temp file');
-    fs.unlinkSync(path.join(dataDir, 'file_44.tmp'));
+    assert.equal(orphan?.path, partOf(target));
+    assert.deepEqual(parts(), [path.basename(partOf(target))], 'the reported orphan is the only part');
+    fs.unlinkSync(partOf(target));
   });
 
   await check('MID-FLIGHT CUTOFF (buffered): socket killed during the write; it lands, then unlink, then close', async () => {
@@ -239,10 +244,10 @@ async function main() {
       'write:start', 'disconnect', 'tx:abort', 'write:end',
       'unlink:start', 'unlink:end', 'close:start', 'close:end', 'tx:settled',
     ]);
-    assert.ok(!files().includes('file_99.tmp') && !files().includes('file_99.final'));
+    assert.ok(!fs.existsSync(partOf(target)) && !files().includes('file_99.final'));
   });
 
-  await check('OUT-OF-ORDER CONCURRENCY (buffered): 100 commits + 20 lease contenders + 20 aborts at 10-150 ms disk latency', async () => {
+  await check('OUT-OF-ORDER CONCURRENCY (buffered): 100 commits + 20 commit contenders + 20 aborts at 10-150 ms disk latency', async () => {
     app.knobs.diskLatencyMs = [10, 150];
     const bodies = new Map();
     const body = (id, who) => {
@@ -275,7 +280,7 @@ async function main() {
       const final = path.join(dataDir, `file_${r.id}.final`);
       if (fs.existsSync(final)) assert.equal(fs.readFileSync(final, 'utf8'), body(r.id, r.who));
     }
-    assert.deepEqual(tmpFiles(), []);
+    assert.deepEqual(parts(), []);
   });
 
   // PHASE 3: STREAMING ------------------------------------------------------
@@ -289,11 +294,11 @@ async function main() {
       return { ...c, target };
     });
     await sleep(450);
-    const streaming = tmpFiles().filter((f) => /^blob_1\d\d\.tmp$/.test(f));
-    const onDisk = streaming.map((f) => fs.statSync(path.join(dataDir, f)).size);
+    const streaming = clients.map((c) => partOf(c.target)).filter((f) => fs.existsSync(f));
+    const onDisk = streaming.map((f) => fs.statSync(f).size);
     const midway = await stats();
-    console.log(`    at 450 ms: ${streaming.length} temp files filling from their sockets (${Math.min(...onDisk)}-${Math.max(...onDisk)} bytes each); Elm holds ${midway.inFlight} transactions`);
-    assert.equal(streaming.length, 30, 'every upload streams into its own leased temp file');
+    console.log(`    at 450 ms: ${streaming.length} parts filling from their sockets (${Math.min(...onDisk)}-${Math.max(...onDisk)} bytes each); Elm holds ${midway.inFlight} transactions`);
+    assert.equal(streaming.length, 30, 'every upload streams into its own part');
     assert.ok(onDisk.every((n) => n > 0), 'bytes reach the disk while the client is still sending');
     await Promise.all(clients.map((c) => c.closed));
     await quiescent();
@@ -303,10 +308,10 @@ async function main() {
       const unlinked = of(id).find((e) => e.name === 'unlink:end' && e.at > cut.at);
       return ms(unlinked.at - cut.at);
     });
-    console.log(`    disconnect -> temp file unlinked: p50 ${quantile(latencies, 0.5).toFixed(2)} ms, p99 ${quantile(latencies, 0.99).toFixed(2)} ms, max ${Math.max(...latencies).toFixed(2)} ms`);
+    console.log(`    disconnect -> part unlinked: p50 ${quantile(latencies, 0.5).toFixed(2)} ms, p99 ${quantile(latencies, 0.99).toFixed(2)} ms, max ${Math.max(...latencies).toFixed(2)} ms`);
     assert.ok(Math.max(...latencies) < 10, 'every abort was cleaned up within 10 ms');
-    assert.deepEqual(tmpFiles(), []);
-    assert.ok(!files().some((f) => /^blob_1\d\d\.bin$/.test(f)), 'nothing aborted was committed');
+    assert.deepEqual(parts(), []);
+    assert.ok(!blobs().some((f) => /^1\d\d$/.test(f)), 'nothing aborted was committed');
   });
 
   await check('SLOWLORIS (never hangs up): a 10 B/s upload is answered 408 and severed by the meter', async () => {
@@ -320,10 +325,10 @@ async function main() {
     const aborted = first(id, 'tx:abort');
     const unlinked = of(id).find((e) => e.name === 'unlink:end');
     const severed = ms(unlinked.at - aborted.at);
-    console.log(`    the bridge got Elm's abort -> temp file unlinked: ${severed.toFixed(2)} ms; client saw ${JSON.stringify(c.text().split('\r\n')[0] || '(reset)')}`);
+    console.log(`    the bridge got Elm's abort -> part unlinked: ${severed.toFixed(2)} ms; client saw ${JSON.stringify(c.text().split('\r\n')[0] || '(reset)')}`);
     assert.ok(severed < 10);
     assert.match(c.text(), /^HTTP\/1\.1 408 /, 'the client is told why before the connection closes');
-    assert.deepEqual(tmpFiles(), []);
+    assert.deepEqual(parts(), []);
   });
 
   await check('an on-pace client is never called a slowloris because the meter read a stale count (L-spec Thm 14)', async () => {
@@ -338,7 +343,7 @@ async function main() {
     c.sock.write(Buffer.alloc(6000, 0x63));
     await c.closed;
     assert.match(c.text(), /HTTP\/1\.1 201 /, c.text().split('\r\n').filter((l) => l.startsWith('HTTP/')).join(' | '));
-    assert.equal(fs.statSync(path.join(dataDir, 'blob_250.bin')).size, 12000);
+    assert.equal(fs.statSync(blobPath(250)).size, 12000);
   });
 
   await check('slowloris JSON: a trickled /echo body is answered 408 and the connection is closed', async () => {
@@ -409,7 +414,7 @@ async function main() {
     c.sock.write(body);
     await c.closed;
     assert.match(c.text(), /HTTP\/1\.1 201 /);
-    assert.equal(sha256(fs.readFileSync(path.join(dataDir, 'blob_301.bin'))), sha256(body));
+    assert.equal(sha256(fs.readFileSync(blobPath(301))), sha256(body));
   });
 
   await check('a chunked upload that crosses the limit mid-stream is severed and rolled back', async () => {
@@ -435,7 +440,8 @@ async function main() {
     small.server.close();
     console.log(`    client saw: ${r}`);
     assert.ok(r === 413 || r === 'ECONNRESET' || r === 'EPIPE', `unexpected ${r}`);
-    assert.ok(!files().includes('blob_302.tmp') && !files().includes('blob_302.bin'));
+    assert.deepEqual(parts(), []);
+    assert.ok(!blobs().includes('302'));
   });
 
   await check('SLOW READER: a client that stops reading a 100 MiB download loses its fd to the delivery meter', async () => {
@@ -486,10 +492,22 @@ async function main() {
     await quiescent();
     for (const { id, r } of done) {
       assert.equal(r.status, 201);
-      assert.equal(sha256(fs.readFileSync(path.join(dataDir, `blob_${id}.bin`))), sha256(payloads.get(id)));
+      assert.equal(sha256(fs.readFileSync(blobPath(id))), sha256(payloads.get(id)));
     }
-    assert.deepEqual(tmpFiles(), []);
-    assert.ok(!files().some((f) => /^blob_[67]\d\d\.bin$/.test(f)), 'no cut or starved upload was committed');
+    assert.deepEqual(parts(), []);
+    assert.ok(!blobs().some((f) => /^[67]\d\d$/.test(f)), 'no cut or starved upload was committed');
+  });
+
+  await check('ONE ID, TWO UPLOADS: nothing excludes them while they stream; link lets exactly one commit, and the blob is its bytes', async () => {
+    const a = randomBytes(MiB);
+    const b = randomBytes(MiB);
+    const [ra, rb] = await Promise.all([a, b].map((body) => send(port, { method: 'PUT', path: '/blobs/800', body })));
+    assert.deepEqual([ra.status, rb.status].sort(), [201, 409]);
+    const winner = ra.status === 201 ? a : b;
+    assert.equal(sha256(fs.readFileSync(blobPath(800))), sha256(winner));
+    assert.equal(json(ra.status === 201 ? rb : ra).hostError.syscall, 'link', 'the loser lost at the commit, not at a lease');
+    await quiescent();
+    assert.deepEqual(parts(), []);
   });
 
   // UNRECOGNIZED HOST ERRORS -------------------------------------------------
@@ -500,15 +518,81 @@ async function main() {
     assert.ok(faults.some((f) => f.event === 'unclassified' && f.error.code === 'ELOOP'));
   });
 
-  await check('ENOTDIR (data dir is a file) is a fatal 500, never "missing"', async () => {
-    const other = start({ port: 0, dataDir: path.join(dataDir, 'blob_1.bin'), upstream: upstreamUrl, log: () => {} });
+  await check('a data dir that is a file: the server halts at boot, never listens, and logs ENOTDIR', async () => {
+    const other = start({ port: 0, dataDir: blobPath(1), upstream: upstreamUrl, log: () => {} });
+    const otherFaults = [];
+    other.events.on('fault', (f) => otherFaults.push(f));
+    const reason = await new Promise((resolve) => other.events.on('halt', resolve));
+    await sleep(50);
+    assert.equal(other.server.listening, false);
+    assert.match(reason, /could not be prepared/);
+    assert.deepEqual(otherFaults.map((f) => [f.tx, f.event, f.error.code]), [['janitor', 'unclassified', 'ENOTDIR']]);
+    other.server.close();
+  });
+
+  await check('ENOTDIR on a lease (the parts dir replaced by a file) is a fatal 500, never "missing"', async () => {
+    const dir = await fsp.mkdtemp(path.join(root, 'notdir-'));
+    const other = start({ port: 0, dataDir: dir, upstream: upstreamUrl, log: () => {} });
     const otherFaults = [];
     other.events.on('fault', (f) => otherFaults.push(f));
     await listening(other.server);
+    await waitFor('the boot sweep to settle', () => other.txs.size === 0);
+    fs.rmdirSync(path.join(dir, '.tmp'));
+    fs.writeFileSync(path.join(dir, '.tmp'), '');
     const r = await send(other.server.address().port, { method: 'POST', path: '/ingest/1', body: '{}' });
     other.server.close();
+    await fsp.rm(dir, { recursive: true, force: true });
     assert.deepEqual([r.status, json(r).fatal], [500, true]);
-    assert.equal(otherFaults[0].error.code, 'ENOTDIR');
+    assert.deepEqual(otherFaults.map((f) => f.error.code), ['ENOTDIR']);
+  });
+
+  // THE JANITOR ----------------------------------------------------------------
+
+  await check('the boot sweep removes stale parts, and nothing else: not young parts, foreign files, directories or symlinks', async () => {
+    const dir = await fsp.mkdtemp(path.join(root, 'janitor-'));
+    const tmp = path.join(dir, '.tmp');
+    fs.mkdirSync(tmp);
+    fs.mkdirSync(path.join(dir, 'blobs'));
+    fs.writeFileSync(path.join(dir, 'blobs', '5'), 'committed');
+    const threeHoursAgo = new Date(Date.now() - 3 * 3600 * 1000);
+    const planted = {
+      'dead.part': () => fs.writeFileSync(path.join(tmp, 'dead.part'), 'a corpse'),
+      'young.part': () => fs.writeFileSync(path.join(tmp, 'young.part'), 'a recent corpse'),
+      'notes.txt': () => fs.writeFileSync(path.join(tmp, 'notes.txt'), 'not ours'),
+      'dir.part': () => fs.mkdirSync(path.join(tmp, 'dir.part')),
+      'link.part': () => fs.symlinkSync(path.join(dir, 'blobs', '5'), path.join(tmp, 'link.part')),
+    };
+    for (const [name, make] of Object.entries(planted)) {
+      make();
+      if (name !== 'young.part') fs.lutimesSync(path.join(tmp, name), threeHoursAgo, threeHoursAgo);
+    }
+    const other = start({ port: 0, dataDir: dir, upstream: upstreamUrl, log: () => {} });
+    await listening(other.server);
+    await waitFor('the boot sweep to settle', () => other.txs.size === 0);
+    const s = json(await send(other.server.address().port, { path: '/stats' }));
+    other.server.close();
+    const left = fs.readdirSync(tmp).sort();
+    const target = fs.readFileSync(path.join(dir, 'blobs', '5'), 'utf8');
+    await fsp.rm(dir, { recursive: true, force: true });
+    assert.deepEqual(left, ['dir.part', 'link.part', 'notes.txt', 'young.part']);
+    assert.equal(target, 'committed', 'the symlink was not followed');
+    assert.deepEqual([s.swept, s.faults], [1, 0]);
+  });
+
+  await check('the alarm: a part that goes stale while the server runs is swept; closing the server stops the alarm', async () => {
+    const dir = await fsp.mkdtemp(path.join(root, 'alarm-'));
+    const other = start({ port: 0, dataDir: dir, upstream: upstreamUrl, transferDeadlineMs: 300, staleAfterMs: 600, sweepEveryMs: 100, log: () => {} });
+    await listening(other.server);
+    const corpse = path.join(dir, '.tmp', `${randomUUID()}.part`);
+    fs.writeFileSync(corpse, 'left by a process that died just now');
+    const t0 = Date.now();
+    await waitFor('the alarm to sweep the corpse', () => !fs.existsSync(corpse), 3000);
+    const after = Date.now() - t0;
+    console.log(`    a fresh corpse was swept ${after} ms after it was written (staleAfterMs 600, sweepEveryMs 100)`);
+    assert.ok(after >= 600, 'not before it was stale');
+    other.server.close();
+    await waitFor('the last sweep to settle', () => other.txs.size === 0);
+    await fsp.rm(dir, { recursive: true, force: true });
   });
 
   // BLOBS --------------------------------------------------------------------
@@ -556,7 +640,7 @@ async function main() {
     await quiescent();
     console.log(`    delayed: ${delayed['2xx']} x 2xx; ingest: ${ingest['2xx']} durable commits, p99 ${ingest.latency.p99} ms`);
     for (const r of [delayed, ingest]) assert.deepEqual([r.errors, r.timeouts, r.non2xx], [0, 0, 0]);
-    assert.deepEqual(tmpFiles(), []);
+    assert.deepEqual(parts(), []);
   });
 
   await check('upstream down: ECONNREFUSED is a 502 naming the host error', async () => {
@@ -572,7 +656,7 @@ async function main() {
     console.log(`    ${JSON.stringify(s)}`);
     assert.deepEqual([app.exchanges.size, app.handles.size, app.txs.size], [0, 0, 0]);
     assert.equal(s.received, s.responded + s.abandoned);
-    assert.deepEqual(tmpFiles(), []);
+    assert.deepEqual(parts(), []);
     assert.deepEqual([...new Set(faults.map((f) => f.event))].sort(), ['orphan', 'unclassified'], JSON.stringify(faults));
     assert.ok(openFds() <= baselineFds, `fds: ${openFds()} now, ${baselineFds} at start`);
   });

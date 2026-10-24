@@ -9,11 +9,17 @@ module Server exposing
     , Meter
     , Model
     , Msg(..)
+    , Owner(..)
+    , Phase(..)
     , Rate
+    , Sweep(..)
     , Work(..)
     , init
     , maxUpstreamBytes
+    , ownerFromKey
+    , ownerKey
     , step
+    , sweepEvery
     )
 
 {-| The router as a pure state machine.
@@ -42,6 +48,12 @@ jobs do) compares them with the clock. An Elm `Process.sleep` cannot be
 cancelled, so arming one per request would leave a timer alive long after
 the request is gone.
 
+The server opens only once its layout exists: `init` begins a transaction
+that creates the parts and blob directories, and `Listen` goes out only
+when it settles cleanly. Until then the bridge is not listening, so no
+request can reach a lease whose directory is missing. The same janitor then
+collects the parts that crashed processes left behind; see THE JANITOR.
+
 -}
 
 import Commit
@@ -53,6 +65,7 @@ import Http.Route as Route exposing (Route)
 import Io exposing (Handle, HostError)
 import Json.Decode as Decode
 import Json.Encode as Encode
+import Layout exposing (Layout, Part)
 import Plan
 import Tx
 import Verdict exposing (Fault(..), Verdict)
@@ -74,15 +87,47 @@ type alias Config =
     , jsonLimit : Int
     , uploadLimit : Int
     , progressEveryMs : Int
+    , staleAfterMs : Int
+    , sweepEveryMs : Int
     }
 
 
 type alias Model =
     { config : Config
+    , layout : Layout
+    , phase : Phase
+    , sweep : Sweep
     , now : Int
     , jobs : Dict String Job
     , ledger : Ledger
     }
+
+
+{-| `Stopped` is final: the layout could not be prepared, or the bridge's
+server closed. Jobs still in flight drain; nothing new is swept.
+-}
+type Phase
+    = Booting
+    | Serving
+    | Stopped
+
+
+{-| The janitor's one transaction, if it has one. `Preparing` is the boot
+transaction; a sweep is `Surveying` until the listing comes back, then
+`Discarding` the parts it judged stale.
+-}
+type Sweep
+    = Preparing
+    | Surveying (Plan.Suspended Plan.Fresh)
+    | Discarding (List Part)
+    | Idle
+
+
+{-| Who a transaction belongs to: a client's exchange, or the server.
+-}
+type Owner
+    = Exchange RequestId
+    | Janitor
 
 
 type alias Job =
@@ -152,20 +197,24 @@ type alias Ledger =
     , aborted : Int
     , faults : Int
     , orphans : Int
+    , swept : Int
     }
 
 
 {-| `Received` carries the host clock at arrival; `Tick` carries it on
 every beat; `Progressed` carries the bridge's clock at the moment it took the
 count, so a count and its index are written together (L-spec Corollary
-16.2). All are milliseconds since the epoch.
+16.2). All are milliseconds since the epoch. `SweepDue` is the janitor's
+alarm and `Closed` is the bridge's server shutting down.
 -}
 type Msg
     = Received RequestId Int Decode.Value
     | ClientGone RequestId
-    | Reported RequestId Decode.Value
+    | Reported Owner Decode.Value
     | Progressed RequestId Int Bool Int
     | Tick Int
+    | SweepDue
+    | Closed
 
 
 {-| Each becomes one entry in the single ordered instruction array `Main`
@@ -173,10 +222,49 @@ sends per update.
 -}
 type Effect
     = Respond RequestId Response Response.Connection
-    | Begin RequestId Plan.Program
-    | Extend RequestId Plan.Program
+    | Begin Owner Plan.Program
+    | Extend Owner Plan.Program
     | Abort RequestId
-    | Report RequestId Fault
+    | Report Owner Fault
+    | Listen
+    | Halt String
+
+
+{-| A transaction's name on the wire. A request's is its request id, which
+the bridge mints with `randomUUID`; "janitor" is not a UUID, so the two
+names can never meet, and `ownerFromKey` inverts `ownerKey`.
+-}
+ownerKey : Owner -> String
+ownerKey owner =
+    case owner of
+        Exchange id ->
+            Request.idToString id
+
+        Janitor ->
+            "janitor"
+
+
+ownerFromKey : String -> Owner
+ownerFromKey name =
+    if name == "janitor" then
+        Janitor
+
+    else
+        Exchange (Request.idFromString name)
+
+
+{-| How often the janitor's alarm should ring, if it should: only while
+serving and between sweeps. Like `Tick`, it is a subscription that exists
+only while it has work, so a closed server leaves no timer behind.
+-}
+sweepEvery : Model -> Maybe Int
+sweepEvery model =
+    case ( model.phase, model.sweep ) of
+        ( Serving, Idle ) ->
+            Just model.config.sweepEveryMs
+
+        _ ->
+            Nothing
 
 
 maxUpstreamBytes : Int
@@ -184,22 +272,47 @@ maxUpstreamBytes =
     65536
 
 
-init : Config -> Model
+init : Config -> ( Model, List Effect )
 init config =
-    { config = config
-    , now = 0
-    , jobs = Dict.empty
-    , ledger =
-        { received = 0
-        , responded = 0
-        , abandoned = 0
-        , timedOut = 0
-        , tooSlow = 0
-        , aborted = 0
-        , faults = 0
-        , orphans = 0
-        }
-    }
+    let
+        model =
+            { config = config
+            , layout = Layout.fromDataDir config.dataDir
+            , phase = Booting
+            , sweep = Preparing
+            , now = 0
+            , jobs = Dict.empty
+            , ledger =
+                { received = 0
+                , responded = 0
+                , abandoned = 0
+                , timedOut = 0
+                , tooSlow = 0
+                , aborted = 0
+                , faults = 0
+                , orphans = 0
+                , swept = 0
+                }
+            }
+    in
+    case misconfigured config of
+        Just why ->
+            ( { model | phase = Stopped, sweep = Idle }, [ Halt why ] )
+
+        Nothing ->
+            ( model, [ Begin Janitor (Plan.fresh |> Plan.prepare model.layout |> Plan.end) ] )
+
+
+misconfigured : Config -> Maybe String
+misconfigured config =
+    if config.staleAfterMs <= config.transferDeadlineMs then
+        Just "staleAfterMs must exceed transferDeadlineMs, or the janitor could take a part from a transaction that can still commit it"
+
+    else if config.sweepEveryMs <= 0 then
+        Just "sweepEveryMs must be positive"
+
+    else
+        Nothing
 
 
 step : Msg -> Model -> ( Model, List Effect )
@@ -236,6 +349,23 @@ step msg model =
 
                         Gone ->
                             ( model, [] )
+
+        SweepDue ->
+            case ( model.phase, model.sweep ) of
+                ( Serving, Idle ) ->
+                    let
+                        ( program, suspended ) =
+                            Plan.fresh |> Plan.survey model.layout |> Plan.suspend
+                    in
+                    ( { model | sweep = Surveying suspended }, [ Begin Janitor program ] )
+
+                _ ->
+                    -- An alarm already queued when the last sweep began or
+                    -- the server stopped.
+                    ( model, [] )
+
+        Closed ->
+            ( { model | phase = Stopped }, [] )
 
         Progressed id bytes running at ->
             withJob id model <|
@@ -277,10 +407,18 @@ step msg model =
                 ( { model | now = now }, [] )
                 model.jobs
 
-        Reported id value ->
+        Reported Janitor value ->
+            case Decode.decodeValue Tx.reportDecoder value of
+                Ok txReport ->
+                    janitorReported txReport model
+
+                Err error ->
+                    janitorBroke ("a report that does not decode: " ++ Decode.errorToString error) model
+
+        Reported (Exchange id) value ->
             case Dict.get (key id) model.jobs of
                 Nothing ->
-                    report id [ Anomaly "a report for a transaction nobody holds" ] model
+                    report (Exchange id) [ Anomaly "a report for a transaction nobody holds" ] model
 
                 Just job ->
                     case Decode.decodeValue Tx.reportDecoder value of
@@ -412,26 +550,26 @@ react id job txReport model =
             { job | body = drained job.work txReport job.body }
 
         generic =
-            cleanupFaults txReport ++ List.map (\h -> Anomaly ("transaction left handle " ++ h ++ " open; the bridge closed it")) txReport.leaked
+            hygiene txReport
     in
     case txReport.status of
         Tx.Paused ->
             case drainedJob.client of
                 Waiting ->
-                    case continue model.config id drainedJob txReport of
+                    case continue model id drainedJob txReport of
                         Just next ->
                             let
                                 ( answered, afterAnswer, answering ) =
                                     applyAnswer id next.answer drainedJob model
                             in
                             ( putJob id { answered | work = next.work, meter = next.meter } afterAnswer
-                            , answering ++ [ Extend id next.program ]
+                            , answering ++ [ Extend (Exchange id) next.program ]
                             )
 
                         Nothing ->
                             let
                                 ( m, fx ) =
-                                    report id [ Anomaly "a transaction paused where its plan has no pause" ] (putJob id drainedJob model)
+                                    report (Exchange id) [ Anomaly "a transaction paused where its plan has no pause" ] (putJob id drainedJob model)
                             in
                             ( m, fx ++ [ Abort id ] )
 
@@ -457,7 +595,7 @@ conclude : RequestId -> Job -> Maybe Response -> List Fault -> Model -> ( Model,
 conclude id job reply faults model =
     let
         ( reported, reports ) =
-            report id faults model
+            report (Exchange id) faults model
 
         ( answered, afterAnswer, answering ) =
             applyAnswer id (Maybe.map Inline reply |> Maybe.withDefault Unanswered) job reported
@@ -467,7 +605,7 @@ conclude id job reply faults model =
                 Waiting ->
                     let
                         ( m, fx ) =
-                            report id [ Anomaly "a transaction settled without answering its client" ] afterAnswer
+                            report (Exchange id) [ Anomaly "a transaction settled without answering its client" ] afterAnswer
                     in
                     ( count (\l -> { l | responded = l.responded + 1 }) m
                     , fx ++ [ Respond id (Response.problem Response.InternalServerError "the request ended without an answer" []) (connection answered.body) ]
@@ -583,8 +721,11 @@ drained work txReport body =
             body
 
 
-cleanupFaults : Tx.Report -> List Fault
-cleanupFaults txReport =
+{-| What any settled report says about the transaction's own cleanup:
+failed cleanups, and handles it forgot to close.
+-}
+hygiene : Tx.Report -> List Fault
+hygiene txReport =
     List.concatMap
         (\cleanup ->
             case cleanup.outcome of
@@ -600,6 +741,7 @@ cleanupFaults txReport =
                             [ Unclassified ("cleanup " ++ cleanup.kind) error ]
         )
         txReport.cleanups
+        ++ List.map (\h -> Anomaly ("transaction left handle " ++ h ++ " open; the bridge closed it")) txReport.leaked
 
 
 
@@ -614,9 +756,12 @@ type alias Continuation =
     }
 
 
-continue : Config -> RequestId -> Job -> Tx.Report -> Maybe Continuation
-continue config id job txReport =
+continue : Model -> RequestId -> Job -> Tx.Report -> Maybe Continuation
+continue model id job txReport =
     let
+        config =
+            model.config
+
         finishWith program answer =
             Just { answer = answer, work = Closing, program = program, meter = Nothing }
     in
@@ -632,7 +777,7 @@ continue config id job txReport =
                         Ok payload ->
                             let
                                 spec =
-                                    Commit.ingest id config.dataDir itemId payload
+                                    Commit.ingest model.layout id itemId payload
                             in
                             Just { answer = Unanswered, work = Committing spec, program = Commit.saga spec (Plan.resume suspended), meter = Nothing }
 
@@ -939,7 +1084,7 @@ begin id body outcome model =
 
         Start start ->
             ( putJob id { client = Waiting, work = start.work, body = body, meter = start.meter, deadline = model.now + start.deadlineMs } model
-            , [ Begin id start.program ]
+            , [ Begin (Exchange id) start.program ]
             )
 
 
@@ -1038,7 +1183,7 @@ dispatch model id request r =
         Route.Upload itemId ->
             let
                 spec =
-                    Commit.upload id config.dataDir itemId { maxBytes = config.uploadLimit, sendContinue = request.expectsContinue }
+                    Commit.upload model.layout id itemId { maxBytes = config.uploadLimit, sendContinue = request.expectsContinue }
             in
             within config.uploadLimit <|
                 Start
@@ -1052,7 +1197,7 @@ dispatch model id request r =
             let
                 ( program, suspended ) =
                     Plan.fresh
-                        |> Plan.openRead { handle = Io.handle (Request.idToString id) "blob", path = blobPath config.dataDir itemId }
+                        |> Plan.openRead { handle = Io.handle (Request.idToString id) "blob", path = Layout.finalPath (Layout.blob model.layout itemId) }
                         |> Plan.stat
                         |> Plan.suspend
             in
@@ -1127,11 +1272,6 @@ bodyRejected problem =
             Response.problem Response.BadRequest "body is not a single valid JSON text" []
 
 
-blobPath : String -> ItemId -> String
-blobPath dir id =
-    dir ++ "/blob_" ++ String.fromInt (Domain.itemIdToInt id) ++ ".bin"
-
-
 statDecoder : Decode.Decoder { size : Int, isFile : Bool }
 statDecoder =
     Decode.map2 (\size isFile -> { size = size, isFile = isFile })
@@ -1198,6 +1338,310 @@ fromUpstream expected reply =
 
 
 
+-- THE JANITOR
+
+
+{-| A process killed mid-upload leaves its part behind. Nothing waits on a
+part, so collecting corpses is housekeeping, not recovery: right after boot,
+and then `sweepEveryMs` after each sweep ends, the janitor lists the parts
+directory and removes every entry that
+
+  - is a regular file whose name `Layout.partFromName` accepts; anything
+    else in the directory is not ours and is never touched,
+  - was last modified more than `staleAfterMs` before the listing was
+    taken, as measured by the host clock that the bridge reads when it
+    lists, which is the same clock that wrote the mtime (L-spec Corollary
+    16.2: Elm's own clock may be hours stale on an idle server), and
+  - is not the part of a job this process holds.
+
+The last rule is what makes a sweep safe for this process, whatever the
+clocks do. The second protects other processes sharing the directory: every
+transaction that writes a part ends within `transferDeadlineMs` of its
+start, so a part untouched for longer than `staleAfterMs` (which `init`
+insists is longer) belongs to no transaction that can still commit it,
+unless its process stalled for the whole difference. Even then nothing is
+corrupted: that commit's link finds no part and fails with ENOENT.
+
+-}
+janitorReported : Tx.Report -> Model -> ( Model, List Effect )
+janitorReported txReport model =
+    let
+        ( checked, hygieneFaults ) =
+            report Janitor (hygiene txReport) model
+
+        ( next, effects ) =
+            case ( model.sweep, txReport.status ) of
+                ( Preparing, Tx.Settled ) ->
+                    prepared txReport checked
+
+                ( Surveying suspended, Tx.Paused ) ->
+                    surveyed suspended txReport checked
+
+                ( Surveying _, Tx.Settled ) ->
+                    case txReport.steps of
+                        [ Err error ] ->
+                            report Janitor [ Unclassified "listing the parts directory" error ] { checked | sweep = Idle }
+
+                        _ ->
+                            janitorBroke "a survey settled without its listing" checked
+
+                ( Discarding doomed, Tx.Settled ) ->
+                    discarded doomed txReport checked
+
+                _ ->
+                    janitorBroke "a janitor report that matches no janitor transaction" checked
+    in
+    ( next, hygieneFaults ++ effects )
+
+
+{-| The bridge broke the protocol. A broken boot halts; a broken sweep is
+given up. The extension ends the transaction if it is paused and is ignored
+by the bridge if it is not.
+-}
+janitorBroke : String -> Model -> ( Model, List Effect )
+janitorBroke detail model =
+    let
+        ( reported, faults ) =
+            report Janitor [ Anomaly detail ] model
+    in
+    case model.sweep of
+        Preparing ->
+            ( { reported | phase = Stopped, sweep = Idle }, faults ++ [ Halt "the data directory could not be prepared" ] )
+
+        _ ->
+            ( { reported | sweep = Idle }, faults ++ [ Extend Janitor (Plan.end Plan.fresh) ] )
+
+
+prepared : Tx.Report -> Model -> ( Model, List Effect )
+prepared txReport model =
+    case txReport.steps of
+        [ Ok _, Ok _ ] ->
+            case model.phase of
+                Booting ->
+                    let
+                        ( program, suspended ) =
+                            Plan.fresh |> Plan.survey model.layout |> Plan.suspend
+                    in
+                    ( { model | phase = Serving, sweep = Surveying suspended }, [ Listen, Begin Janitor program ] )
+
+                Serving ->
+                    janitorBroke "the layout was prepared twice" model
+
+                Stopped ->
+                    -- The server closed while booting: it never opens.
+                    ( { model | sweep = Idle }, [] )
+
+        steps ->
+            case List.reverse steps of
+                (Err error) :: _ ->
+                    let
+                        ( reported, faults ) =
+                            report Janitor [ Unclassified "preparing the data directory" error ] { model | phase = Stopped, sweep = Idle }
+                    in
+                    ( reported, faults ++ [ Halt "the data directory could not be prepared" ] )
+
+                _ ->
+                    janitorBroke "the layout transaction settled without preparing the layout" model
+
+
+surveyed : Plan.Suspended Plan.Fresh -> Tx.Report -> Model -> ( Model, List Effect )
+surveyed suspended txReport model =
+    let
+        finish doomed =
+            if List.isEmpty doomed then
+                Plan.end (Plan.resume suspended)
+
+            else
+                Plan.resume suspended |> Plan.discard doomed |> Plan.end
+    in
+    case txReport.steps of
+        [ Ok value ] ->
+            case Decode.decodeValue listingDecoder value of
+                Ok listing ->
+                    let
+                        ( doomed, unreadable ) =
+                            judgeListing model listing
+
+                        ( reported, faults ) =
+                            report Janitor unreadable { model | sweep = Discarding doomed }
+                    in
+                    ( reported, faults ++ [ Extend Janitor (finish doomed) ] )
+
+                Err error ->
+                    let
+                        ( reported, faults ) =
+                            report Janitor [ Anomaly ("a listing that does not decode: " ++ Decode.errorToString error) ] { model | sweep = Discarding [] }
+                    in
+                    ( reported, faults ++ [ Extend Janitor (finish []) ] )
+
+        _ ->
+            let
+                ( reported, faults ) =
+                    report Janitor [ Anomaly "a survey paused without its listing" ] { model | sweep = Discarding [] }
+            in
+            ( reported, faults ++ [ Extend Janitor (finish []) ] )
+
+
+discarded : List Part -> Tx.Report -> Model -> ( Model, List Effect )
+discarded doomed txReport model =
+    let
+        idle =
+            { model | sweep = Idle }
+    in
+    case ( doomed, txReport.steps ) of
+        ( [], [] ) ->
+            ( idle, [] )
+
+        ( _, [ Ok value ] ) ->
+            case Decode.decodeValue (Decode.field "outcomes" (Decode.list Io.outcomeDecoder)) value of
+                Ok outcomes ->
+                    if List.length outcomes /= List.length doomed then
+                        report Janitor [ Anomaly "an unlink report that does not match what was doomed" ] idle
+
+                    else
+                        let
+                            results =
+                                List.map2 Tuple.pair doomed outcomes
+
+                            removed =
+                                List.length (List.filter (\( _, outcome ) -> isOk outcome) results)
+
+                            faults =
+                                List.concatMap
+                                    (\( doomedPart, outcome ) ->
+                                        case outcome of
+                                            Ok _ ->
+                                                []
+
+                                            Err error ->
+                                                Verdict.orphanUnlessGone (Layout.partPath doomedPart) error
+                                    )
+                                    results
+                        in
+                        report Janitor faults (count (\l -> { l | swept = l.swept + removed }) idle)
+
+                Err error ->
+                    report Janitor [ Anomaly ("an unlink report that does not decode: " ++ Decode.errorToString error) ] idle
+
+        ( _, [ Err error ] ) ->
+            report Janitor [ Unclassified "removing stale parts" error ] idle
+
+        _ ->
+            report Janitor [ Anomaly "a discard settled without the outcome of its unlinks" ] idle
+
+
+isOk : Result e a -> Bool
+isOk result =
+    case result of
+        Ok _ ->
+            True
+
+        Err _ ->
+            False
+
+
+type alias Listing =
+    { at : Int
+    , entries : List Entry
+    }
+
+
+type alias Entry =
+    { name : String
+    , meta : Result HostError { isFile : Bool, mtimeMs : Float }
+    }
+
+
+listingDecoder : Decode.Decoder Listing
+listingDecoder =
+    let
+        meta =
+            Decode.map2 (\isFile mtimeMs -> { isFile = isFile, mtimeMs = mtimeMs })
+                (Decode.field "isFile" Decode.bool)
+                (Decode.field "mtimeMs" Decode.float)
+    in
+    Decode.map2 Listing
+        (Decode.field "at" Decode.int)
+        (Decode.field "entries"
+            (Decode.list
+                (Decode.map2 Entry
+                    (Decode.field "name" Decode.string)
+                    (Decode.field "stat"
+                        (Decode.oneOf
+                            [ Decode.field "ok" (Decode.map Ok meta)
+                            , Decode.field "error" (Decode.map Err Io.hostErrorDecoder)
+                            ]
+                        )
+                    )
+                )
+            )
+        )
+
+
+{-| The parts to remove, and what the listing could not tell us.
+-}
+judgeListing : Model -> Listing -> ( List Part, List Fault )
+judgeListing model listing =
+    let
+        held =
+            List.filterMap heldPart (Dict.values model.jobs)
+
+        stale meta =
+            meta.isFile && toFloat listing.at - meta.mtimeMs > toFloat model.config.staleAfterMs
+    in
+    List.foldr
+        (\entry ( doomed, faults ) ->
+            case ( Layout.partFromName model.layout entry.name, entry.meta ) of
+                ( Nothing, _ ) ->
+                    ( doomed, faults )
+
+                ( Just candidate, Ok meta ) ->
+                    if stale meta && not (List.member candidate held) then
+                        ( candidate :: doomed, faults )
+
+                    else
+                        ( doomed, faults )
+
+                ( Just candidate, Err error ) ->
+                    case Io.classify error of
+                        Io.NoEntry ->
+                            -- Removed since the directory was read, by the
+                            -- transaction that wrote it.
+                            ( doomed, faults )
+
+                        _ ->
+                            ( doomed, Unclassified ("inspecting " ++ Layout.partPath candidate) error :: faults )
+        )
+        ( [], [] )
+        listing.entries
+
+
+heldPart : Job -> Maybe Part
+heldPart job =
+    case job.work of
+        Committing spec ->
+            Just spec.part
+
+        Echoing ->
+            Nothing
+
+        ReceivingJson _ _ ->
+            Nothing
+
+        Fetching _ ->
+            Nothing
+
+        OpeningBlob _ _ ->
+            Nothing
+
+        Delivering ->
+            Nothing
+
+        Closing ->
+            Nothing
+
+
+
 -- BOOKKEEPING
 
 
@@ -1227,8 +1671,8 @@ count f model =
     { model | ledger = f model.ledger }
 
 
-report : RequestId -> List Fault -> Model -> ( Model, List Effect )
-report id faults model =
+report : Owner -> List Fault -> Model -> ( Model, List Effect )
+report owner faults model =
     ( count
         (\l ->
             { l
@@ -1237,7 +1681,7 @@ report id faults model =
             }
         )
         model
-    , List.map (Report id) faults
+    , List.map (Report owner) faults
     )
 
 
@@ -1275,6 +1719,7 @@ encodeStats model =
         , ( "aborted", Encode.int l.aborted )
         , ( "faults", Encode.int l.faults )
         , ( "orphans", Encode.int l.orphans )
+        , ( "swept", Encode.int l.swept )
         , ( "inFlight", Encode.int waiting )
         , ( "draining", Encode.int (List.length jobs - waiting) )
         ]

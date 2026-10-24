@@ -3,13 +3,17 @@ module WorldTest exposing (suite)
 {-| Model-based test: `Server.step` against a simulated host.
 
 Each request's transaction runs on the reference interpreter (`Tx.Machine`),
-standing in for the bridge. Under it, a fake filesystem with Linux semantics
-(a failed open creates nothing, a failed write leaves a partial file, close
-always frees the fd, link is create-only) and fake sockets that can die
-mid-body. Every operation can fail with an injected error; completions,
-deadlines, departures, progress reports and rate checks arrive in random
-interleavings. Afterwards everything is drained and the world is checked
-for leaks, orphans, lies and hung requests.
+standing in for the bridge, and so does the janitor's. Under them, a fake
+filesystem with Linux semantics (a failed open creates nothing, a failed
+write leaves a partial file, close always frees the fd, link is
+create-only, every write stamps an mtime from the world clock) and fake
+sockets that can die mid-body. The parts directory starts with the corpses
+of an earlier process, one stale and one fresh, and a file that is not a
+part. Every operation can fail with an injected error; completions,
+deadlines, departures, progress reports, rate checks and sweeps arrive in
+random interleavings. Afterwards everything is drained, the clock jumps far
+ahead, one last sweep runs, and the world is checked for leaks, debris,
+lies and hung requests.
 
 -}
 
@@ -22,7 +26,7 @@ import Io exposing (HostError, Op)
 import Json.Decode as Decode
 import Json.Encode as Encode
 import Plan
-import Server exposing (Effect(..), Msg(..))
+import Server exposing (Effect(..), Msg(..), Owner(..))
 import Set exposing (Set)
 import Test exposing (Test, describe, fuzzWith)
 import Test.Distribution
@@ -41,7 +45,24 @@ config =
     , jsonLimit = 64
     , uploadLimit = 64
     , progressEveryMs = 100
+    , staleAfterMs = 5000
+    , sweepEveryMs = 1000
     }
+
+
+{-| The previous process's leftovers, and when each was last written.
+-}
+planted : List ( String, Int )
+planted =
+    [ ( "/d/.tmp/dead.part", -100000 )
+    , ( "/d/.tmp/young.part", 0 )
+    , ( "/d/.tmp/notes", -100000 )
+    ]
+
+
+youngMtime : Int
+youngMtime =
+    0
 
 
 type alias Info =
@@ -55,6 +76,7 @@ type alias World =
     { model : Server.Model
     , machines : Dict String Tx.Machine
     , files : Dict String String
+    , mtimes : Dict String Int
     , fds : Dict String String
     , responses : Dict String (List Int)
     , faults : List ( String, Verdict.Fault )
@@ -67,15 +89,22 @@ type alias World =
     , moved : Dict String Int
     , injectedInto : Set String
     , outbox : List Effect
+    , halted : Bool
+    , sweptWhileLive : Bool
     , violations : List String
     }
 
 
 emptyWorld : World
 emptyWorld =
-    { model = Server.init config
+    let
+        ( model, boot ) =
+            Server.init config
+    in
+    { model = model
     , machines = Dict.empty
-    , files = Dict.fromList [ ( "/d/blob_1.bin", "BLOBDATA" ) ]
+    , files = Dict.fromList (( "/d/blobs/1", "BLOBDATA" ) :: List.map (\( path, _ ) -> ( path, "left by a dead process" )) planted)
+    , mtimes = Dict.fromList (( "/d/blobs/1", -100000 ) :: planted)
     , fds = Dict.empty
     , responses = Dict.empty
     , faults = []
@@ -87,7 +116,9 @@ emptyWorld =
     , clock = 0
     , moved = Dict.empty
     , injectedInto = Set.empty
-    , outbox = []
+    , outbox = boot
+    , halted = False
+    , sweptWhileLive = False
     , violations = []
     }
 
@@ -103,6 +134,7 @@ type Choice
     | Push Int Int
     | Wait Int
     | Deliver Int
+    | Sweep
 
 
 injectable : List String
@@ -127,6 +159,7 @@ choice =
         , ( 2, Fuzz.map2 Push (Fuzz.intRange 0 20) (Fuzz.intRange 0 6000) )
         , ( 2, Fuzz.map Wait (Fuzz.oneOfValues [ 50, 400, 1100, 2100, 3100 ]) )
         , ( 4, Fuzz.map Deliver (Fuzz.intRange 1 4) )
+        , ( 1, Fuzz.constant Sweep )
         ]
 
 
@@ -153,10 +186,10 @@ arrive template world =
                     ( ( "POST", "/ingest/2" ), { body = "{\"r\":" ++ n ++ "}", declared = True, final = Just "/d/file_2.final" } )
 
                 2 ->
-                    ( ( "PUT", "/blobs/3" ), { body = "BLOB-" ++ n, declared = True, final = Just "/d/blob_3.bin" } )
+                    ( ( "PUT", "/blobs/3" ), { body = "BLOB-" ++ n, declared = True, final = Just "/d/blobs/3" } )
 
                 3 ->
-                    ( ( "PUT", "/blobs/3" ), { body = "BLOB-" ++ n ++ String.repeat 70 "x", declared = False, final = Just "/d/blob_3.bin" } )
+                    ( ( "PUT", "/blobs/3" ), { body = "BLOB-" ++ n ++ String.repeat 70 "x", declared = False, final = Just "/d/blobs/3" } )
 
                 4 ->
                     ( ( "GET", "/blobs/1" ), { body = "", declared = False, final = Nothing } )
@@ -266,6 +299,11 @@ apply c world =
         Deliver k ->
             deliver k world
 
+        Sweep ->
+            -- The alarm can ring at any time; the server decides whether it
+            -- means anything.
+            feed SweepDue world
+
 
 {-| Elm's instructions reach the bridge through a port mailbox, in order but
 late: the bridge can report, and the client can leave, in between.
@@ -350,20 +388,40 @@ ok fields =
     Ok (Encode.object fields)
 
 
+hostError : String -> String -> HostError
+hostError code syscall =
+    Decode.decodeValue Io.hostErrorDecoder
+        (Encode.object
+            [ ( "name", Encode.string "Error" )
+            , ( "code", Encode.string code )
+            , ( "syscall", Encode.string syscall )
+            , ( "rawMessage", Encode.string (code ++ ": injected") )
+            , ( "cause", Encode.null )
+            ]
+        )
+        |> Result.withDefault Io.revokedError
+
+
 err : String -> String -> Result HostError Decode.Value
 err code syscall =
-    Err
-        (Decode.decodeValue Io.hostErrorDecoder
-            (Encode.object
-                [ ( "name", Encode.string "Error" )
-                , ( "code", Encode.string code )
-                , ( "syscall", Encode.string syscall )
-                , ( "rawMessage", Encode.string (code ++ ": injected") )
-                , ( "cause", Encode.null )
-                ]
-            )
-            |> Result.withDefault Io.revokedError
-        )
+    Err (hostError code syscall)
+
+
+{-| Writing a file stamps its mtime with the world clock.
+-}
+put : String -> String -> World -> World
+put path content world =
+    { world | files = Dict.insert path content world.files, mtimes = Dict.insert path world.clock world.mtimes }
+
+
+remove : String -> World -> World
+remove path world =
+    { world | files = Dict.remove path world.files, mtimes = Dict.remove path world.mtimes }
+
+
+liveRequests : World -> List String
+liveRequests world =
+    List.filter (\key -> key /= Server.ownerKey Janitor) (Dict.keys world.machines)
 
 
 execute : Bool -> Maybe String -> String -> Op -> World -> ( World, Result HostError Decode.Value )
@@ -408,7 +466,7 @@ execute signalled injected id op world =
                     success
 
         partial path w =
-            { w | files = Dict.insert path (String.left (String.length info.body // 2) info.body) w.files }
+            put path (String.left (String.length info.body // 2) info.body) w
 
         consumed w =
             { w | drained = Set.insert id w.drained }
@@ -430,7 +488,7 @@ execute signalled injected id op world =
                             ( world, err "EEXIST" "open" )
 
                         ( Io.CreateExclusive, False ) ->
-                            ( { world | files = Dict.insert open.path "" world.files, fds = Dict.insert (Io.handleToString open.handle) open.path world.fds }, ok [] )
+                            ( put open.path "" { world | fds = Dict.insert (Io.handleToString open.handle) open.path world.fds }, ok [] )
 
                         ( Io.ReadOnly, True ) ->
                             ( { world | fds = Dict.insert (Io.handleToString open.handle) open.path world.fds }, ok [] )
@@ -443,10 +501,10 @@ execute signalled injected id op world =
                     \path ->
                         case failure of
                             Just code ->
-                                ( { world | files = Dict.insert path (String.left (String.length text // 2) text) world.files }, err code "write" )
+                                ( put path (String.left (String.length text // 2) text) world, err code "write" )
 
                             Nothing ->
-                                ( { world | files = Dict.insert path text world.files }
+                                ( put path text world
                                 , ok [ ( "bytes", Encode.int (String.length text) ), ( "sha256", Encode.string ("sha:" ++ text) ) ]
                                 )
 
@@ -466,7 +524,7 @@ execute signalled injected id op world =
                                         ( partial path world, err "ACKBERRY_LIMIT" "" )
 
                                     else
-                                        ( consumed { world | files = Dict.insert path info.body world.files }
+                                        ( consumed (put path info.body world)
                                         , ok [ ( "bytes", Encode.int (String.length info.body) ), ( "sha256", Encode.string ("sha:" ++ info.body) ) ]
                                         )
 
@@ -513,15 +571,75 @@ execute signalled injected id op world =
                             ( world, err "ENOENT" "link" )
 
                         ( Just content, False ) ->
-                            ( { world | files = Dict.insert link.to content world.files }, ok [] )
+                            -- A second name for the same inode: same bytes, same mtime.
+                            ( { world
+                                | files = Dict.insert link.to content world.files
+                                , mtimes = Dict.insert link.to (Dict.get link.from world.mtimes |> Maybe.withDefault world.clock) world.mtimes
+                              }
+                            , ok []
+                            )
 
             Io.Unlink path ->
                 failOr "unlink" world <|
                     if Dict.member path world.files then
-                        ( { world | files = Dict.remove path world.files }, ok [] )
+                        ( remove path world, ok [] )
 
                     else
                         ( world, err "ENOENT" "unlink" )
+
+            Io.EnsureDir _ ->
+                failOr "mkdir" world ( world, ok [ ( "created", Encode.null ) ] )
+
+            Io.ListDir dir ->
+                failOr "scandir" world <|
+                    ( world
+                    , ok
+                        [ ( "at", Encode.int world.clock )
+                        , ( "entries"
+                          , Encode.list
+                                (\path ->
+                                    Encode.object
+                                        [ ( "name", Encode.string (String.dropLeft (String.length dir + 1) path) )
+                                        , ( "stat"
+                                          , Encode.object
+                                                [ ( "ok"
+                                                  , Encode.object
+                                                        [ ( "isFile", Encode.bool True )
+                                                        , ( "mtimeMs", Encode.float (toFloat (Dict.get path world.mtimes |> Maybe.withDefault world.clock)) )
+                                                        ]
+                                                  )
+                                                ]
+                                          )
+                                        ]
+                                )
+                                (List.filter (String.startsWith (dir ++ "/")) (Dict.keys world.files))
+                          )
+                        ]
+                    )
+
+            Io.UnlinkEach paths ->
+                let
+                    each path ( w, outcomes ) =
+                        case failure of
+                            Just code ->
+                                ( w, outcomes ++ [ Encode.object [ ( "error", Io.encodeHostError (hostError code "unlink") ) ] ] )
+
+                            Nothing ->
+                                if Dict.member path w.files then
+                                    ( remove path w, outcomes ++ [ Encode.object [ ( "ok", Encode.object [] ) ] ] )
+
+                                else
+                                    ( w, outcomes ++ [ Encode.object [ ( "error", Io.encodeHostError (hostError "ENOENT" "unlink") ) ] ] )
+
+                    ( after, results ) =
+                        List.foldl each ( world, [] ) paths
+
+                    removedSome =
+                        Dict.size after.files < Dict.size world.files
+                in
+                ( { after | sweptWhileLive = after.sweptWhileLive || (removedSome && not (List.isEmpty (liveRequests world))) }
+                , ok [ ( "outcomes", Encode.list identity results ) ]
+                )
 
             Io.SyncDir _ ->
                 failOr "fsync" world ( world, ok [] )
@@ -592,7 +710,7 @@ transition id ( machine, reports ) world =
                 Nothing ->
                     stored
     in
-    List.foldl (\r w -> feed (Reported (Request.idFromString id) (Tx.encodeReport r)) w) started reports
+    List.foldl (\r w -> feed (Reported (Server.ownerFromKey id) (Tx.encodeReport r)) w) started reports
 
 
 feed : Msg -> World -> World
@@ -644,12 +762,15 @@ judgeEmission jobsBefore effect world =
             else
                 queued
 
-        Extend id program ->
+        Extend (Exchange id) program ->
             if not (wasWaiting (Request.idToString id)) && not (List.isEmpty (Plan.steps program)) then
                 violate (Request.idToString id ++ " was extended with new steps after its client stopped waiting") queued
 
             else
                 queued
+
+        Extend Janitor program ->
+            List.foldl (judgeDoom world) queued (doomedBy program)
 
         Begin _ _ ->
             queued
@@ -657,8 +778,47 @@ judgeEmission jobsBefore effect world =
         Abort _ ->
             queued
 
-        Report id fault ->
-            { world | faults = world.faults ++ [ ( Request.idToString id, fault ) ] }
+        Listen ->
+            queued
+
+        Halt _ ->
+            queued
+
+        Report owner fault ->
+            { world | faults = world.faults ++ [ ( Server.ownerKey owner, fault ) ] }
+
+
+doomedBy : Plan.Program -> List String
+doomedBy program =
+    List.concatMap
+        (\step ->
+            case step of
+                Tx.Do (Io.UnlinkEach paths) _ ->
+                    paths
+
+                _ ->
+                    []
+        )
+        (Plan.steps program)
+
+
+{-| What the janitor may never take, judged against the world as it is
+when the janitor decides: a live transaction's part, anything that is not
+a part, and a corpse younger than `staleAfterMs`.
+-}
+judgeDoom : World -> String -> World -> World
+judgeDoom world path w =
+    if not (String.startsWith "/d/.tmp/" path && String.endsWith ".part" path) then
+        violate ("the janitor doomed " ++ path ++ ", which is not a part") w
+
+    else if List.any (\key -> path == "/d/.tmp/" ++ key ++ ".part") (liveRequests world) then
+        violate ("the janitor doomed " ++ path ++ " while its transaction was live") w
+
+    else if path == "/d/.tmp/young.part" && world.clock - youngMtime <= config.staleAfterMs then
+        violate ("the janitor doomed " ++ path ++ " at " ++ String.fromInt world.clock ++ ", before it was stale") w
+
+    else
+        w
 
 
 {-| The bridge applies one instruction.
@@ -684,13 +844,13 @@ carryOut effect world =
                     , over = Set.insert key world.over
                 }
 
-        Begin id program ->
-            transition (Request.idToString id) (Tx.boot (Plan.steps program) (Plan.continuation program)) world
+        Begin owner program ->
+            transition (Server.ownerKey owner) (Tx.boot (Plan.steps program) (Plan.continuation program)) world
 
-        Extend id program ->
+        Extend owner program ->
             let
                 key =
-                    Request.idToString id
+                    Server.ownerKey owner
 
                 steps =
                     Plan.steps program
@@ -740,6 +900,12 @@ carryOut effect world =
 
                 Nothing ->
                     world
+
+        Listen ->
+            world
+
+        Halt _ ->
+            { world | halted = True }
 
         Report _ _ ->
             world
@@ -798,11 +964,14 @@ simulate choices =
         ran =
             List.foldl apply emptyWorld choices |> drain 5000
 
-        -- Long after everything: every deadline has passed.
+        -- Long after everything: every deadline has passed, every part is
+        -- stale, and one more sweep runs.
         later =
             ran.clock + 100000
     in
     drain 5000 (feed (Tick later) { ran | clock = later })
+        |> feed SweepDue
+        |> drain 5000
 
 
 
@@ -885,7 +1054,7 @@ write and never another resource's bytes.
 corruptFinals : World -> List String
 corruptFinals world =
     Dict.toList world.files
-        |> List.filter (\( path, _ ) -> String.endsWith ".final" path || (String.endsWith ".bin" path && path /= "/d/blob_1.bin"))
+        |> List.filter (\( path, _ ) -> String.endsWith ".final" path || (String.startsWith "/d/blobs/" path && path /= "/d/blobs/1"))
         |> List.filter
             (\( path, content ) ->
                 not (Dict.values world.requests |> List.any (\i -> i.final == Just path && i.body == content))
@@ -900,14 +1069,29 @@ unanswered world =
         |> List.filter (\id -> not (Dict.member id world.responses) && not (Set.member id world.left))
 
 
+{-| Every part still on disk was reported, or nobody was left to sweep it:
+the earlier process's corpses survive only a server that never opened.
+-}
+debris : World -> List String
+debris world =
+    let
+        excused =
+            if world.halted then
+                Set.union (orphanPaths world) (Set.fromList (List.map Tuple.first planted))
+
+            else
+                orphanPaths world
+    in
+    Dict.keys world.files
+        |> List.filter (\path -> String.startsWith "/d/.tmp/" path && String.endsWith ".part" path)
+        |> List.filter (\path -> not (Set.member path excused))
+
+
 quiescent : List Choice -> Expectation
 quiescent choices =
     let
         world =
             simulate choices
-
-        tmpFiles =
-            Dict.keys world.files |> List.filter (String.endsWith ".tmp") |> Set.fromList
     in
     Expect.all
         [ \w -> Expect.equal [] w.violations
@@ -916,7 +1100,8 @@ quiescent choices =
         , \w -> Expect.equal [] (Dict.keys w.machines) |> Expect.onFail "a transaction never settled"
         , \w -> Expect.equal Dict.empty w.fds |> Expect.onFail "an fd (lease) leaked"
         , \w -> Expect.equal 0 (Dict.size w.model.jobs) |> Expect.onFail "a job outlived its transaction"
-        , \w -> Expect.equal (orphanPaths w) tmpFiles |> Expect.onFail "temp files on disk differ from the orphans reported"
+        , \w -> Expect.equal [] (debris w) |> Expect.onFail "parts left on disk that nobody reported"
+        , \w -> Expect.equal True (Dict.member "/d/.tmp/notes" w.files) |> Expect.onFail "the janitor removed a file that is not a part"
         , \w -> Expect.equal [] (createdButNotStored w)
         , \w -> Expect.equal [] (corruptFinals w)
         , \w -> Expect.equal [] (unanswered w) |> Expect.onFail "a request was neither answered nor abandoned"
@@ -936,7 +1121,7 @@ answeredWith code world =
 
 uploadCommitted : World -> Bool
 uploadCommitted world =
-    Dict.member "/d/blob_3.bin" world.files
+    Dict.member "/d/blobs/3" world.files
 
 
 abortedMidBody : World -> Bool
@@ -954,14 +1139,15 @@ suite =
                 Test.expectDistribution
                     [ ( Test.Distribution.atLeast 15, "a commit answered 201", simulate >> answeredWith 201 )
                     , ( Test.Distribution.atLeast 10, "a streamed upload committed", simulate >> uploadCommitted )
-                    , ( Test.Distribution.atLeast 10, "a lease race lost (409)", simulate >> answeredWith 409 )
+                    , ( Test.Distribution.atLeast 10, "a commit race lost (409)", simulate >> answeredWith 409 )
                     , ( Test.Distribution.atLeast 5, "a client vanished mid-body", simulate >> abortedMidBody )
                     , ( Test.Distribution.atLeast 3, "the meter answered 408", simulate >> answeredWith 408 )
                     , ( Test.Distribution.atLeast 3, "a body was refused for size (413)", simulate >> answeredWith 413 )
-                    , ( Test.Distribution.atLeast 2, "a temp file was orphaned and reported", simulate >> orphanPaths >> Set.isEmpty >> not )
+                    , ( Test.Distribution.atLeast 2, "a part was orphaned and reported", simulate >> orphanPaths >> Set.isEmpty >> not )
+                    , ( Test.Distribution.atLeast 2, "the janitor removed parts while requests were live", simulate >> .sweptWhileLive )
                     ]
             }
             (Fuzz.listOfLengthBetween 10 90 choice)
-            "no leaked fds, no unreported temp files, no 201 without its bytes, no hung request"
+            "no leaked fds, no unreported parts, no 201 without its bytes, no hung request, no live part swept"
             quiescent
         ]

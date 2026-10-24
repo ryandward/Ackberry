@@ -75,6 +75,9 @@ type Op
     | ReadBody { maxBytes : Int, sendContinue : Bool }
     | PipeBody { handle : Handle, maxBytes : Int, sendContinue : Bool }
     | Stream { handle : Handle, length : Int, status : Int, headers : List String }
+    | EnsureDir String
+    | ListDir String
+    | UnlinkEach (List String)
 
 
 {-| Which primitives observe an abort while in flight. Sockets and streams
@@ -96,6 +99,15 @@ interruptible op =
 
         HttpGet _ ->
             True
+
+        EnsureDir _ ->
+            False
+
+        ListDir _ ->
+            False
+
+        UnlinkEach _ ->
+            False
 
         Open _ ->
             False
@@ -196,6 +208,20 @@ encodeOp op =
                 , ( "status", Encode.int stream.status )
                 , ( "headers", Encode.list Encode.string stream.headers )
                 ]
+
+            -- mkdir -p; when it creates a directory, its parent is fsync'd so
+            -- the new entry survives a crash.
+            EnsureDir p ->
+                [ kind "ensureDir", path p ]
+
+            -- Every entry with its own lstat outcome; nothing filtered.
+            ListDir p ->
+                [ kind "listDir", path p ]
+
+            -- One unlink per path, each with its own outcome; one failure
+            -- does not stop the rest.
+            UnlinkEach paths ->
+                [ kind "unlinkEach", ( "paths", Encode.list Encode.string paths ) ]
 
 
 

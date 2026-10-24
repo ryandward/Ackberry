@@ -9,25 +9,33 @@ module Commit exposing
     , upload
     )
 
-{-| Create-only commit of bytes to `final`, as one transaction.
+{-| Create-only commit of bytes to a final name, as one transaction.
 
-    open(tmp, O_CREAT|O_EXCL)   the lease: the kernel grants it or says EEXIST
-                                registers: Always close, OnFailure unlink tmp
+    open(part, O_CREAT|O_EXCL)  the lease: a part named after this transaction
+                                registers: Always close, OnFailure unlink part
     write | pipe the body       a buffered payload, or the socket straight to disk
     fsync(fd)                   the bytes are durable before any name points at them
-    link(tmp, final)            COMMIT: create-only, EEXIST if final exists
-    unlink(tmp)                 roll forward
-    fsync(dir)                  roll forward: the new name survives a crash
+    link(part, final)           COMMIT: create-only, EEXIST if final exists
+    unlink(part)                roll forward
+    fsync(final's dir)          roll forward: the new name survives a crash
     close(fd)                   the Always cleanup, last
 
-Before the commit, any failure or abort unwinds to: unlink tmp, close.
+Before the commit, any failure or abort unwinds to: unlink part, close.
 After it, nothing is undone. The fd is closed after the link rather than
 before so that one `Always` cleanup releases it on every path; the data was
 already fsync'd, so the order changes nothing on disk.
 
-The commit is link(2), not rename(2), because rename silently replaces an
-existing final file, which is data loss. renameat2(RENAME\_NOREPLACE) would
-do it in one call, but Node does not expose it.
+The part is anonymous (see `Layout`): a transaction killed by SIGKILL leaves
+a corpse that blocks nothing, because the next transaction for the same id
+writes its own part. Uploads to one id do not exclude each other while they
+stream; they race at the commit, and `link(2)` lets exactly one win.
+
+The commit is link(2), not rename(2). With anonymous parts nothing else
+stops two uploads to one id from both reaching the commit, and rename would
+let the second silently replace the first after both clients were told 201:
+a lost write. renameat2(RENAME\_NOREPLACE) would be one call, but Node does
+not expose it. link-then-unlink gives the same guarantee on the final name:
+it appears atomically, holding complete fsync'd bytes, exactly once.
 
 -}
 
@@ -37,6 +45,7 @@ import Http.Response as Response exposing (Response)
 import Io exposing (Handle, HostError)
 import Json.Decode as Decode
 import Json.Encode as Encode
+import Layout exposing (Final, Layout, Part)
 import Plan exposing (Plan)
 import Tx
 import Verdict exposing (Fault(..), Verdict)
@@ -67,41 +76,30 @@ type Fill
 type alias Spec =
     { label : String
     , id : ItemId
-    , dir : String
-    , tmp : String
-    , final : String
+    , part : Part
+    , final : Final
     , lease : Handle
     , fill : Fill
     }
 
 
-ingest : RequestId -> String -> ItemId -> Payload -> Spec
-ingest request dir id payload =
-    let
-        base =
-            dir ++ "/file_" ++ String.fromInt (Domain.itemIdToInt id)
-    in
+ingest : Layout -> RequestId -> ItemId -> Payload -> Spec
+ingest layout request id payload =
     { label = "itemId"
     , id = id
-    , dir = dir
-    , tmp = base ++ ".tmp"
-    , final = base ++ ".final"
+    , part = Layout.part layout request
+    , final = Layout.ingested layout id
     , lease = Io.handle (Request.idToString request) "lease"
     , fill = Buffered payload
     }
 
 
-upload : RequestId -> String -> ItemId -> { maxBytes : Int, sendContinue : Bool } -> Spec
-upload request dir id body =
-    let
-        base =
-            dir ++ "/blob_" ++ String.fromInt (Domain.itemIdToInt id)
-    in
+upload : Layout -> RequestId -> ItemId -> { maxBytes : Int, sendContinue : Bool } -> Spec
+upload layout request id body =
     { label = "blobId"
     , id = id
-    , dir = dir
-    , tmp = base ++ ".tmp"
-    , final = base ++ ".bin"
+    , part = Layout.part layout request
+    , final = Layout.blob layout id
     , lease = Io.handle (Request.idToString request) "lease"
     , fill = Streamed body
     }
@@ -114,7 +112,7 @@ reach `commit`.
 saga : Spec -> Plan Plan.Fresh -> Plan.Program
 saga spec plan =
     plan
-        |> Plan.lease { handle = spec.lease, tmp = spec.tmp, dir = spec.dir }
+        |> Plan.lease { handle = spec.lease, part = spec.part }
         |> fill spec.fill
         |> Plan.sync
         |> Plan.commit spec.final
@@ -132,7 +130,7 @@ fill how =
 
 
 {-| Read the settled report against the plan's step positions:
-0 open, 1 fill, 2 fsync, 3 link, 4 unlink tmp, 5 fsync dir.
+0 open, 1 fill, 2 fsync, 3 link, 4 unlink part, 5 fsync the final's dir.
 -}
 judge : Spec -> Tx.Report -> Verdict
 judge plan report =
@@ -143,7 +141,7 @@ judge plan report =
                     orphan =
                         case at 4 report.steps of
                             Just (Err error) ->
-                                Verdict.orphanUnlessGone plan.tmp error
+                                Verdict.orphanUnlessGone (Layout.partPath plan.part) error
 
                             _ ->
                                 []
@@ -203,20 +201,20 @@ lastFailure outcomes =
             Nothing
 
 
+{-| Nothing about the id can make this fail: the part's name belongs to
+this transaction alone. So EEXIST is not a conflict but a broken invariant,
+two transactions given one name.
+-}
 acquireFailure : HostError -> Verdict
 acquireFailure error =
     case Io.classify error of
         Io.Exists ->
-            ( Just
-                (Verdict.hostProblem Response.Conflict
-                    "another transaction holds the lease for this id, or a crashed one left its temp file"
-                    error
-                )
-            , []
+            ( Just (Verdict.hostProblem Response.InternalServerError "the transaction's part name was already taken" error)
+            , [ Anomaly "a part named after a fresh transaction already existed: transaction names were reused" ]
             )
 
         Io.NoEntry ->
-            ( Just (Verdict.hostProblem Response.InternalServerError "the data directory does not exist" error), [] )
+            ( Just (Verdict.hostProblem Response.InternalServerError "the parts directory does not exist" error), [] )
 
         Io.Denied ->
             Verdict.diskFailure "acquiring the lease" error
@@ -297,7 +295,10 @@ commitFailure error =
             ( Just (Verdict.hostProblem Response.Conflict "this id has already been committed" error), [] )
 
         Io.NoEntry ->
-            Verdict.fatal "committing: the temp file vanished under its lease" error
+            -- Some other process removed the part under a live lease: a
+            -- second server sharing this directory with a shorter
+            -- staleAfterMs, or a person.
+            Verdict.fatal "committing: the part vanished under its lease" error
 
         Io.Cancelled ->
             Verdict.quiet

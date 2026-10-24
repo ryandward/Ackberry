@@ -9,7 +9,7 @@
     "build:bench": "elm make bench/BlobBench.elm --optimize --output=build/blob-bench.js",
     "start": "npm run build && node server.js",
     "upstream": "node upstream.js",
-    "test": "elm-test && npm run build && npm run build:spec && node tests/vm.js 5000 && node --expose-gc tests/acceptance.js",
+    "test": "elm-test && npm run build && npm run build:spec && node tests/vm.js 5000 && node --expose-gc tests/acceptance.js && node tests/crash.js",
     "bench": "npm run build && npm run build:bench && node bench/blob-bench.js",
     "format": "elm-format --yes src tests bench spec"
   },
