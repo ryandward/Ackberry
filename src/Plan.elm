@@ -70,6 +70,7 @@ What it cannot do, in Elm:
 
 -}
 
+import Http.Request exposing (ConnId)
 import Io exposing (Handle)
 import Layout exposing (Final, Layout, Part)
 import Tx
@@ -145,7 +146,12 @@ append step next (Plan done _) =
     Plan (done ++ [ step ]) next
 
 
-readBody : { maxBytes : Int, sendContinue : Bool } -> Plan Fresh -> Plan Fresh
+{-| `invite` is the interim response to write before reading, `100
+Continue` for a client that is holding its body back. An upload's pipe
+comes after its lease, so a client is never invited to send a body nothing
+can hold yet.
+-}
+readBody : { conn : ConnId, framing : Io.Reading, maxBytes : Int, invite : Maybe String } -> Plan Fresh -> Plan Fresh
 readBody body plan =
     append (Tx.Do (Io.ReadBody body) []) Fresh plan
 
@@ -182,9 +188,9 @@ write text ((Plan _ (Leased l)) as plan) =
     append (Tx.Do (Io.Write l.handle text) []) (Filled l) plan
 
 
-pipe : { maxBytes : Int, sendContinue : Bool } -> Plan Leased -> Plan Filled
+pipe : { conn : ConnId, framing : Io.Reading, maxBytes : Int, invite : Maybe String } -> Plan Leased -> Plan Filled
 pipe body ((Plan _ (Leased l)) as plan) =
-    append (Tx.Do (Io.PipeBody { handle = l.handle, maxBytes = body.maxBytes, sendContinue = body.sendContinue }) []) (Filled l) plan
+    append (Tx.Do (Io.PipeBody { conn = body.conn, handle = l.handle, framing = body.framing, maxBytes = body.maxBytes, invite = body.invite }) []) (Filled l) plan
 
 
 sync : Plan Filled -> Plan Durable
@@ -230,9 +236,9 @@ stat ((Plan _ (Reading h)) as plan) =
     append (Tx.Do (Io.Stat h) []) (Reading h) plan
 
 
-stream : { length : Int, status : Int, headers : List String } -> Plan Reading -> Plan Reading
-stream head ((Plan _ (Reading h)) as plan) =
-    append (Tx.Do (Io.Stream { handle = h, length = head.length, status = head.status, headers = head.headers }) []) (Reading h) plan
+stream : { conn : ConnId, length : Int, head : String } -> Plan Reading -> Plan Reading
+stream out ((Plan _ (Reading h)) as plan) =
+    append (Tx.Do (Io.Stream { conn = out.conn, handle = h, length = out.length, head = out.head }) []) (Reading h) plan
 
 
 {-| Give the file back: the registered close runs when the program ends.

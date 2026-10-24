@@ -1,11 +1,11 @@
 module Http.Head exposing
-    ( Framing(..)
-    , Head
+    ( Head
     , Limits
     , Persistence(..)
     , Problem(..)
     , Version(..)
     , parse
+    , toRequest
     )
 
 {-| A request head, parsed from the bytes the client sent (RFC 9112).
@@ -45,18 +45,12 @@ Problems and the status each one calls for:
 
 -}
 
-import Http.Request as Request exposing (Method)
+import Http.Request as Request exposing (Framing(..), Method)
 
 
 type Version
     = Http10
     | Http11
-
-
-type Framing
-    = NoBody
-    | Length Int
-    | Chunked
 
 
 type Persistence
@@ -720,3 +714,20 @@ isFieldChar c =
             Char.toCode c
     in
     (code >= 0x20 && code <= 0x7E) || code == 0x09 || (code >= 0x80 && code <= 0xFF)
+
+
+{-| The router's view of a head.
+-}
+toRequest : Head -> Request.Request
+toRequest head =
+    let
+        ( path, query ) =
+            Request.splitTarget head.target
+    in
+    { method = head.method
+    , path = path
+    , query = query
+    , headers = head.fields
+    , body = head.framing
+    , expectsContinue = head.expectsContinue
+    }

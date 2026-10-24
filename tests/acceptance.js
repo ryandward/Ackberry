@@ -67,6 +67,32 @@ function rawClient(port, head) {
   return { sock, closed, text: () => Buffer.concat(received).toString('latin1') };
 }
 
+// `promise`, which must settle within `ms`, or the check fails naming `what`.
+function within(ms, what, promise) {
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms waiting for ${what}`)), ms);
+  });
+  return Promise.race([promise, late]).finally(() => clearTimeout(timer));
+}
+
+// The responses on a raw socket so far, split by their Content-Length; a
+// response still arriving is left out.
+function parseResponses(text) {
+  const out = [];
+  let rest = text;
+  for (;;) {
+    const end = rest.indexOf('\r\n\r\n');
+    if (end === -1) return out;
+    const [statusLine, ...lines] = rest.slice(0, end).split('\r\n');
+    const headers = Object.fromEntries(lines.map((l) => [l.slice(0, l.indexOf(':')).toLowerCase(), l.slice(l.indexOf(':') + 1).trim()]));
+    const length = Number(headers['content-length'] ?? 0);
+    if (rest.length < end + 4 + length) return out;
+    out.push({ status: Number(statusLine.split(' ')[1]), headers, body: rest.slice(end + 4, end + 4 + length) });
+    rest = rest.slice(end + 4 + length);
+  }
+}
+
 function sendAndCut(port, { method = 'POST', path: target, body, cut }) {
   return new Promise((resolve) => {
     const req = http.request({ port, method, path: target, headers: { 'content-length': Buffer.byteLength(body) }, agent: false });
@@ -120,25 +146,34 @@ async function main() {
   const trail = [];
   const idOf = new Map(); // target -> request id
   app.events.on('fault', (f) => faults.push(f));
-  app.events.on('request', (r) => idOf.set(r.target, r.request));
+  const connOf = new Map(); // request id -> connection id
+  app.events.on('request', (r) => {
+    idOf.set(r.target, r.request);
+    connOf.set(r.request, r.conn);
+  });
   app.events.on('io', (e) => trail.push({ name: `${e.kind}:${e.phase}`, request: e.request, at: e.at }));
   app.events.on('tx', (e) => trail.push({ name: `tx:${e.phase}`, request: e.request, at: e.at }));
-  app.events.on('disconnect', (d) => trail.push({ name: 'disconnect', request: d.request, at: d.at }));
-  const lingerings = [];
-  app.events.on('linger', (e) => lingerings.push(e));
+  app.events.on('disconnect', (d) => trail.push({ name: 'disconnect', conn: d.conn, at: d.at }));
+  const releases = [];
+  app.events.on('released', (e) => releases.push(e));
   const releaseOf = async (target) => {
-    await waitFor(`the release of ${target}`, () => lingerings.some((e) => e.request === idOf.get(target)));
-    return lingerings.find((e) => e.request === idOf.get(target));
+    const ofTarget = (e) => e.conn === connOf.get(idOf.get(target));
+    await waitFor(`the release of ${target}`, () => releases.some(ofTarget));
+    return releases.find(ofTarget);
   };
-  const of = (id) => trail.filter((e) => e.request === id);
+  // A request's events, and its connection's.
+  const of = (id) => trail.filter((e) => e.request === id || (e.conn !== undefined && e.conn === connOf.get(id)));
   const first = (id, name) => of(id).find((e) => e.name === name);
   // A transaction's part is named after its request, never after the item.
   const partOf = (target) => path.join(dataDir, '.tmp', `${idOf.get(target)}.part`);
 
+  // Every connection closed, the one asking for /stats included, which is
+  // why the bridge is checked before the question is asked.
   const quiescent = (timeoutMs = 5000) =>
     waitFor('quiescence', async () => {
+      if (app.conns.size > 0 || app.txs.size > 0 || app.handles.size > 0) return false;
       const s = await stats();
-      return s.inFlight === 0 && s.draining === 0 && app.txs.size === 0 && app.handles.size === 0 && app.exchanges.size === 0 && app.lingering.size === 0;
+      return s.inFlight === 0 && s.draining === 0;
     }, timeoutMs);
 
   // The server created blobs/ and .tmp/ before it listened.
@@ -444,11 +479,86 @@ async function main() {
       pump();
     });
     await waitFor('the small server to settle', () => small.txs.size === 0 && small.handles.size === 0);
-    small.server.close();
+    small.stop();
     console.log(`    client saw: ${r}`);
     assert.ok(r === 413 || r === 'ECONNRESET' || r === 'EPIPE', `unexpected ${r}`);
     assert.deepEqual(parts(), []);
     assert.ok(!blobs().includes('302'));
+  });
+
+  // CONNECTIONS: the bridge holds the socket, Elm decides what it carries ---
+
+  await check('KEEP-ALIVE: one connection carries request after request, numbered on it, until the client asks to close', async () => {
+    const c = rawClient(port, 'GET /health?ka=0 HTTP/1.1\r\nHost: x\r\n\r\n');
+    await waitFor('the first answer', () => parseResponses(c.text()).length === 1);
+    c.sock.write('GET /items/7?ka=1 HTTP/1.1\r\nHost: x\r\n\r\n');
+    await waitFor('the second answer', () => parseResponses(c.text()).length === 2);
+    c.sock.write('GET /health?ka=2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+    await within(3000, 'the server to close the connection', c.closed);
+    const answers = parseResponses(c.text());
+    assert.deepEqual(answers.map((a) => [a.status, a.headers.connection]), [[200, undefined], [200, undefined], [200, 'close']]);
+    const ids = ['/health?ka=0', '/items/7?ka=1', '/health?ka=2'].map((t) => idOf.get(t));
+    assert.deepEqual(ids, [0, 1, 2].map((n) => `${connOf.get(ids[0])}.${n}`));
+  });
+
+  await check('PIPELINING: a chunked upload with extensions, zero-chunk padding and a trailer, then a GET in the same write: answered in order, and the GET reads the commit', async () => {
+    const c = rawClient(port,
+      'PUT /blobs/303?put HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n'
+      + '5;name="v"\r\nhello\r\n0006\r\n world\r\n000;last\r\nX-Checksum: none\r\n\r\n'
+      + 'GET /blobs/303?get HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n');
+    await within(3000, 'the server to close the connection', c.closed);
+    const answers = parseResponses(c.text());
+    assert.deepEqual(answers.map((a) => a.status), [201, 200]);
+    assert.equal(answers[1].body, 'hello world');
+    assert.equal(fs.readFileSync(blobPath(303), 'latin1'), 'hello world');
+    const [put, got] = ['/blobs/303?put', '/blobs/303?get'].map((t) => idOf.get(t));
+    assert.deepEqual([put, got], [0, 1].map((n) => `${connOf.get(put)}.${n}`), 'both exchanges ride one connection, in order');
+  });
+
+  await check('DEADLINES on the bridge clock: an idle connection is closed at idleMs without a byte; a head that never ends is 408 at the head deadline', async () => {
+    const quick = start({ port: 0, dataDir, upstream: upstreamUrl, headDeadlineMs: 400, idleMs: 200, log: () => {} });
+    await listening(quick.server);
+    const qport = quick.server.address().port;
+    // Times are taken as the bytes arrive, on the clock the server reads too.
+    const idle = rawClient(qport, 'GET /health HTTP/1.1\r\nHost: x\r\n\r\n');
+    let answeredAt = null;
+    idle.sock.on('data', () => { answeredAt ??= performance.now(); });
+    await waitFor('the answer', () => parseResponses(idle.text()).length === 1);
+    const answered = idle.text();
+    await within(3000, 'the idle connection to be closed', idle.closed);
+    const idleFor = performance.now() - answeredAt;
+    const sentAt = performance.now();
+    const stalled = rawClient(qport, 'GET /health HTTP/1.1\r\nHost: x\r\n');
+    let refusedAt = null;
+    stalled.sock.on('data', () => { refusedAt ??= performance.now(); });
+    await waitFor('the 408', () => parseResponses(stalled.text()).length === 1);
+    const stalledFor = refusedAt - sentAt;
+    await within(3000, 'the stalled connection to be closed', stalled.closed);
+    quick.stop();
+    console.log(`    idle connection closed ${idleFor.toFixed(1)} ms after its answer (idleMs 200); the stalled head answered after ${stalledFor.toFixed(1)} ms (headDeadlineMs 400)`);
+    assert.equal(idle.text(), answered, 'nothing is sent on an idle close');
+    assert.deepEqual(parseResponses(stalled.text()).map((a) => [a.status, a.headers.connection]), [[408, 'close']]);
+    // The deadlines count whole milliseconds from the server's reading, at
+    // most 1 ms before the bytes left, and the alarm ticks every 100 ms.
+    assert.ok(idleFor >= 180 && idleFor < 450, `idle close after ${idleFor} ms`);
+    assert.ok(stalledFor >= 398 && stalledFor < 650, `408 after ${stalledFor} ms`);
+  });
+
+  await check('REFUSED HEADS are answered by Elm and the connection closed: 400, 414, 431, 501, 505', async () => {
+    const heads = [
+      ['GET / HTTP/1.1\r\nHost: x\r\nBad Field: y\r\n\r\n', 400],
+      ['POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\nabc', 400],
+      ['GET / HTTP/1.1\r\n\r\n', 400],
+      [`GET /${'a'.repeat(9000)} HTTP/1.1\r\nHost: x\r\n\r\n`, 414],
+      [`GET / HTTP/1.1\r\nHost: x\r\nX: ${'a'.repeat(20000)}`, 431],
+      ['BREW / HTTP/1.1\r\nHost: x\r\n\r\n', 501],
+      ['GET / HTTP/2.0\r\nHost: x\r\n\r\n', 505],
+    ];
+    for (const [head, status] of heads) {
+      const c = rawClient(port, head);
+      await within(3000, `the server to close after refusing ${JSON.stringify(head.slice(0, 40))}`, c.closed);
+      assert.deepEqual(parseResponses(c.text()).map((a) => [a.status, a.headers.connection]), [[status, 'close']], JSON.stringify(head.slice(0, 60)));
+    }
   });
 
   await check('SLOW READER: a client that stops reading a 100 MiB download loses its fd to the delivery meter', async () => {
@@ -534,7 +644,7 @@ async function main() {
     assert.deepEqual([e.how, e.discarded <= 64 * KiB], ['hungUp', true], `${e.how}, ${e.discarded} bytes discarded`);
   });
 
-  await check('STAGED CLOSE: a client that keeps sending is cut once the 128 KiB budget is spent', async () => {
+  await check('STAGED CLOSE: a client that keeps sending stops being read once the 128 KiB budget is spent', async () => {
     const target = '/blobs/901';
     const sock = net.connect(port, '127.0.0.1');
     sock.on('error', () => {});
@@ -610,12 +720,13 @@ async function main() {
   });
 
   await check('STAGED CLOSE: never more than maxSockets lingering; past the cap the close is immediate', async () => {
-    const small = start({ port: 0, dataDir, upstream: upstreamUrl, linger: { deadlineMs: 600, maxBytes: 128 * KiB, maxSockets: 4 }, log: () => {} });
+    const small = start({ port: 0, dataDir, upstream: upstreamUrl, linger: { deadlineMs: 600, budgetBytes: 128 * KiB, maxSockets: 4 }, log: () => {} });
     await listening(small.server);
-    const releases = [];
-    small.events.on('linger', (e) => releases.push(e.how));
+    const released = [];
+    small.events.on('released', (e) => released.push(e.how));
+    const lingering = () => [...small.conns.values()].filter((c) => c.closing !== null && c.closing !== 'asked').length;
     let peak = 0;
-    const sampler = setInterval(() => { peak = Math.max(peak, small.lingering.size); }, 2);
+    const sampler = setInterval(() => { peak = Math.max(peak, lingering()); }, 2);
     await Promise.all(Array.from({ length: 10 }, (_, i) => {
       const sock = net.connect({ port: small.server.address().port, host: '127.0.0.1', allowHalfOpen: true });
       sock.on('error', () => {});
@@ -624,14 +735,16 @@ async function main() {
       const drip = setInterval(() => { if (!sock.destroyed) sock.write('x'); }, 50);
       return closed.then(() => clearInterval(drip));
     }));
-    await waitFor('every release', () => releases.length === 10);
+    await waitFor('every release', () => released.length === 10);
     clearInterval(sampler);
+    // Tallied before /stats opens a connection of its own, whose release
+    // would otherwise race into the count.
+    const counts = released.reduce((acc, how) => ({ ...acc, [how]: (acc[how] ?? 0) + 1 }), {});
     const s = json(await send(small.server.address().port, { path: '/stats' }));
-    small.server.close();
-    const counts = releases.reduce((acc, how) => ({ ...acc, [how]: (acc[how] ?? 0) + 1 }), {});
+    small.stop();
     console.log(`    peak ${peak} lingering; releases ${JSON.stringify(counts)}`);
     assert.equal(peak, 4);
-    assert.deepEqual(counts, { deadline: 4, poolFull: 6 });
+    assert.deepEqual(counts, { deadline: 4, asked: 6 }, 'the four in the pool ran to the deadline, the six past it were closed at once');
     assert.deepEqual([s.lingered.deadlinePassed, s.lingered.poolFull], [4, 6]);
   });
 
@@ -652,7 +765,7 @@ async function main() {
     assert.equal(other.server.listening, false);
     assert.match(reason, /could not be prepared/);
     assert.deepEqual(otherFaults.map((f) => [f.tx, f.event, f.error.code]), [['janitor', 'unclassified', 'ENOTDIR']]);
-    other.server.close();
+    other.stop();
   });
 
   await check('ENOTDIR on a lease (the parts dir replaced by a file) is a fatal 500, never "missing"', async () => {
@@ -665,7 +778,7 @@ async function main() {
     fs.rmdirSync(path.join(dir, '.tmp'));
     fs.writeFileSync(path.join(dir, '.tmp'), '');
     const r = await send(other.server.address().port, { method: 'POST', path: '/ingest/1', body: '{}' });
-    other.server.close();
+    other.stop();
     await fsp.rm(dir, { recursive: true, force: true });
     assert.deepEqual([r.status, json(r).fatal], [500, true]);
     assert.deepEqual(otherFaults.map((f) => f.error.code), ['ENOTDIR']);
@@ -695,7 +808,7 @@ async function main() {
     await listening(other.server);
     await waitFor('the boot sweep to settle', () => other.txs.size === 0);
     const s = json(await send(other.server.address().port, { path: '/stats' }));
-    other.server.close();
+    other.stop();
     const left = fs.readdirSync(tmp).sort();
     const target = fs.readFileSync(path.join(dir, 'blobs', '5'), 'utf8');
     await fsp.rm(dir, { recursive: true, force: true });
@@ -715,7 +828,7 @@ async function main() {
     const after = Date.now() - t0;
     console.log(`    a fresh corpse was swept ${after} ms after it was written (staleAfterMs 600, sweepEveryMs 100)`);
     assert.ok(after >= 600, 'not before it was stale');
-    other.server.close();
+    other.stop();
     await waitFor('the last sweep to settle', () => other.txs.size === 0);
     await fsp.rm(dir, { recursive: true, force: true });
   });
@@ -723,11 +836,11 @@ async function main() {
   // BLOBS --------------------------------------------------------------------
 
   await check('blob: 10 MiB byte-exact with exact Content-Length; missing 404, empty 200, directory 500', async () => {
-    const before = trail.length;
+    const left = (await stats()).abandoned;
     const r = await get('/blobs/1');
     assert.deepEqual([r.status, r.headers['content-length'], sha256(r.raw)], [200, String(blob.length), sha256(blob)]);
     await quiescent();
-    assert.ok(!trail.slice(before).some((e) => e.name === 'disconnect'), 'a finished download is not a client that left');
+    assert.equal((await stats()).abandoned, left, 'a finished download is not a client that left');
     assert.equal((await get('/blobs/2')).status, 404);
     const empty = await get('/blobs/3');
     assert.deepEqual([empty.status, empty.raw.length], [200, 0]);
@@ -775,27 +888,25 @@ async function main() {
     assert.deepEqual([r.status, json(r).hostError.code], [502, 'ECONNREFUSED']);
   });
 
-  await check('no leaks: no exchanges, handles or transactions; ledger balanced; fds at baseline; faults accounted for', async () => {
+  await check('no leaks: no connections, handles or transactions; ledger balanced; fds at baseline; faults accounted for', async () => {
     await quiescent();
     const s = await stats();
     console.log(`    ${JSON.stringify(s)}`);
-    assert.deepEqual([app.exchanges.size, app.handles.size, app.txs.size], [0, 0, 0]);
+    await waitFor('the /stats connection to close', () => app.conns.size === 0);
+    assert.deepEqual([app.conns.size, app.handles.size, app.txs.size], [0, 0, 0]);
     assert.equal(s.received, s.responded + s.abandoned);
     assert.deepEqual(parts(), []);
     assert.deepEqual([...new Set(faults.map((f) => f.event))].sort(), ['orphan', 'unclassified'], JSON.stringify(faults));
-    const released = (how) => lingerings.filter((e) => e.how === how).length;
-    assert.deepEqual(s.lingered, {
-      hungUp: released('hungUp'),
-      deadlinePassed: released('deadline'),
-      budgetSpent: released('budget'),
-      poolFull: released('poolFull'),
-      bytesDiscarded: lingerings.reduce((n, e) => n + e.discarded, 0),
-    }, 'Elm counted every release the bridge reported');
+    const ended = (how) => releases.filter((e) => e.how === how).length;
+    assert.deepEqual(
+      [s.lingered.hungUp, s.lingered.deadlinePassed, s.lingered.budgetSpent, s.lingered.bytesDiscarded],
+      [ended('hungUp'), ended('deadline'), ended('budget'), releases.reduce((n, e) => n + e.discarded, 0)],
+      'Elm counted every dissipation the bridge reported',
+    );
     assert.ok(openFds() <= baselineFds, `fds: ${openFds()} now, ${baselineFds} at start`);
   });
 
-  app.server.closeAllConnections();
-  app.server.close();
+  app.stop();
   await fsp.rm(dataDir, { recursive: true, force: true });
   console.log(`${checks} checks passed`);
   setTimeout(() => {

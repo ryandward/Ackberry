@@ -1,38 +1,32 @@
 module Http.Request exposing
     ( Body(..)
     , BodyProblem(..)
-    , Declared(..)
+    , ConnId
+    , Framing(..)
     , JsonText
     , Method(..)
-    , Rejection(..)
     , Request
     , RequestId
     , allMethods
     , bodyDecoder
-    , fromWire
+    , connIdFromString
+    , connIdToString
     , idFromString
     , idToString
+    , idWithin
     , jsonFrom
     , jsonTextToString
     , methodToString
+    , splitTarget
     )
 
-{-| Wire request types and the single decoder from the bridge's JSON.
+{-| Requests as the router sees them, the ids that name requests and
+connections, and the bodies a step reads.
 
-The bridge sends `[requestId, wire]` the moment the headers are parsed,
-before a single body byte is read:
-
-    { "method": "PUT"
-    , "target": "/blobs/7?x=1"              -- raw req.url, never decoded
-    , "headers": ["Host", "localhost", ...] -- raw req.rawHeaders, flat pairs
-    }
-
-The body stays on the socket, unread, until a transaction step asks for it.
-What the headers say about it is all Elm knows up front, and is enough to
-refuse it without reading it.
-
-The request id travels outside `wire` on purpose: a payload that fails to
-decode still has an address to answer.
+A request is what `Http.Head` made of the head the client sent. Its body
+stays on the socket, unread, until a transaction step asks for it: what the
+head says about the body is all Elm knows up front, and is enough to refuse
+it without reading it.
 
 -}
 
@@ -46,6 +40,31 @@ type RequestId
 idFromString : String -> RequestId
 idFromString =
     RequestId
+
+
+{-| A TCP connection, named by the bridge with `randomUUID` when it accepts
+it, so that no two connections share a name in this process or any other.
+-}
+type ConnId
+    = ConnId String
+
+
+connIdFromString : String -> ConnId
+connIdFromString =
+    ConnId
+
+
+connIdToString : ConnId -> String
+connIdToString (ConnId id) =
+    id
+
+
+{-| The `n`th request on a connection. A request's transaction and its
+part are named after it, so the connection's uniqueness makes theirs.
+-}
+idWithin : ConnId -> Int -> RequestId
+idWithin (ConnId conn) n =
+    RequestId (conn ++ "." ++ String.fromInt n)
 
 
 idToString : RequestId -> String
@@ -104,12 +123,6 @@ methodToString method =
             "CONNECT"
 
 
-methodFromString : String -> Maybe Method
-methodFromString raw =
-    List.filter (\method -> methodToString method == raw) allMethods
-        |> List.head
-
-
 {-| Bytes the bridge read into memory because a step asked it to. It
 transcodes them with a fatal UTF-8 decoder, so a body is either exact text or
 an explicit reason it is not.
@@ -120,13 +133,14 @@ type Body
     | NotUtf8
 
 
-{-| What the headers declare about the body. `Unsized` is chunked transfer
-coding: the length is only known once it has all arrived.
+{-| How the head frames the body (RFC 9112 section 6.3): none, the
+`Content-Length` bytes (never 0, which the head reads as none), or the
+chunked coding, whose length is known only at its last chunk.
 -}
-type Declared
+type Framing
     = NoBody
     | Length Int
-    | Unsized
+    | Chunked
 
 
 type alias Request =
@@ -134,111 +148,9 @@ type alias Request =
     , path : String
     , query : Maybe String
     , headers : List ( String, String )
-    , body : Declared
+    , body : Framing
     , expectsContinue : Bool
     }
-
-
-type Rejection
-    = Malformed Decode.Error
-    | UnsupportedMethod String
-
-
-fromWire : Decode.Value -> Result Rejection Request
-fromWire value =
-    case Decode.decodeValue wireDecoder value of
-        Err error ->
-            Err (Malformed error)
-
-        Ok wire ->
-            case methodFromString wire.method of
-                Nothing ->
-                    Err (UnsupportedMethod wire.method)
-
-                Just method ->
-                    let
-                        ( path, query ) =
-                            splitTarget wire.target
-                    in
-                    Ok
-                        { method = method
-                        , path = path
-                        , query = query
-                        , headers = wire.headers
-                        , body = declared wire.headers
-                        , expectsContinue =
-                            List.any (\( name, field ) -> name == "expect" && String.toLower field == "100-continue") wire.headers
-                        }
-
-
-type alias Wire =
-    { method : String
-    , target : String
-    , headers : List ( String, String )
-    }
-
-
-wireDecoder : Decoder Wire
-wireDecoder =
-    Decode.map3 Wire
-        (Decode.field "method" Decode.string)
-        (Decode.field "target" Decode.string)
-        (Decode.field "headers" headersDecoder)
-
-
-{-| Node's parser has already rejected conflicting or malformed framing
-headers, so a Content-Length that reaches here is digits.
--}
-declared : List ( String, String ) -> Declared
-declared headers =
-    if List.any (\( name, _ ) -> name == "transfer-encoding") headers then
-        Unsized
-
-    else
-        case List.filter (\( name, _ ) -> name == "content-length") headers of
-            ( _, value ) :: _ ->
-                case String.toInt (String.trim value) of
-                    Just 0 ->
-                        NoBody
-
-                    Just n ->
-                        Length n
-
-                    Nothing ->
-                        Unsized
-
-            [] ->
-                NoBody
-
-
-{-| Node's rawHeaders is `[name, value, name, value, ...]`. Names are
-lowercased because HTTP field names are case-insensitive.
--}
-headersDecoder : Decoder (List ( String, String ))
-headersDecoder =
-    Decode.list Decode.string
-        |> Decode.andThen
-            (\flat ->
-                case pairUp flat [] of
-                    Just pairs ->
-                        Decode.succeed pairs
-
-                    Nothing ->
-                        Decode.fail "rawHeaders has an odd number of entries"
-            )
-
-
-pairUp : List String -> List ( String, String ) -> Maybe (List ( String, String ))
-pairUp flat acc =
-    case flat of
-        [] ->
-            Just (List.reverse acc)
-
-        name :: value :: rest ->
-            pairUp rest (( String.toLower name, value ) :: acc)
-
-        [ _ ] ->
-            Nothing
 
 
 bodyDecoder : Decoder Body

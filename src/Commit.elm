@@ -40,7 +40,7 @@ it appears atomically, holding complete fsync'd bytes, exactly once.
 -}
 
 import Domain exposing (ItemId)
-import Http.Request as Request exposing (JsonText, RequestId)
+import Http.Request as Request exposing (ConnId, JsonText, RequestId)
 import Http.Response as Response exposing (Response)
 import Io exposing (Handle, HostError)
 import Json.Decode as Decode
@@ -70,7 +70,7 @@ parsePayload text =
 
 type Fill
     = Buffered Payload
-    | Streamed { maxBytes : Int, sendContinue : Bool }
+    | Streamed { conn : ConnId, framing : Io.Reading, maxBytes : Int, invite : Maybe String }
 
 
 type alias Spec =
@@ -94,7 +94,7 @@ ingest layout request id payload =
     }
 
 
-upload : Layout -> RequestId -> ItemId -> { maxBytes : Int, sendContinue : Bool } -> Spec
+upload : Layout -> RequestId -> ItemId -> { conn : ConnId, framing : Io.Reading, maxBytes : Int, invite : Maybe String } -> Spec
 upload layout request id body =
     { label = "blobId"
     , id = id
@@ -243,6 +243,9 @@ acquireFailure error =
         Io.TooLarge ->
             Verdict.fatal "acquiring the lease" error
 
+        Io.Malformed ->
+            Verdict.fatal "acquiring the lease" error
+
         Io.Unrecognized ->
             Verdict.fatal "acquiring the lease" error
 
@@ -256,6 +259,9 @@ fillFailure error =
         Io.Reset ->
             -- The client hung up mid-body. Nobody will read this answer.
             ( Just (Verdict.hostProblem Response.BadRequest "the request body was cut off" error), [] )
+
+        Io.Malformed ->
+            ( Just (Verdict.hostProblem Response.BadRequest "the chunked body is malformed" error), [] )
 
         Io.Cancelled ->
             Verdict.quiet
@@ -325,6 +331,9 @@ commitFailure error =
             Verdict.fatal "committing" error
 
         Io.TooLarge ->
+            Verdict.fatal "committing" error
+
+        Io.Malformed ->
             Verdict.fatal "committing" error
 
         Io.Unrecognized ->

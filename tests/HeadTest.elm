@@ -2,8 +2,8 @@ module HeadTest exposing (suite)
 
 import Expect
 import Fuzz exposing (Fuzzer)
-import Http.Head as Head exposing (Framing(..), Persistence(..), Problem(..), Version(..))
-import Http.Request as Request
+import Http.Head as Head exposing (Persistence(..), Problem(..), Version(..))
+import Http.Request as Request exposing (Framing(..))
 import Test exposing (Test, describe, fuzz, test)
 
 

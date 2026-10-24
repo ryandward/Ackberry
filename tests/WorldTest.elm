@@ -21,10 +21,10 @@ import Dict exposing (Dict)
 import Expect exposing (Expectation)
 import Fuzz exposing (Fuzzer)
 import Http.Request as Request
-import Http.Response as Response
 import Io exposing (HostError, Op)
 import Json.Decode as Decode
 import Json.Encode as Encode
+import Kernel
 import Plan
 import Server exposing (Effect(..), Msg(..), Owner(..))
 import Set exposing (Set)
@@ -47,8 +47,23 @@ config =
     , progressEveryMs = 100
     , staleAfterMs = 5000
     , sweepEveryMs = 1000
-    , linger = { deadlineMs = 500, maxBytes = 131072, maxSockets = 64 }
+    , head = { maxHeadBytes = 16384, maxTarget = 8192, maxFields = 100 }
+    , headDeadlineMs = 2500
+    , idleMs = 1500
+    , tickMs = 100
+    , linger = { deadlineMs = 500, budgetBytes = 131072, maxSockets = 2 }
+    , chunked = { maxLine = 8192, maxTrailer = 16384 }
     }
+
+
+{-| What the bridge knows of a connection: open, closing as Elm asked,
+dissipating, or shut (its fd is closed and Elm has been told).
+-}
+type Wire
+    = Open
+    | AskedToClose
+    | Dissipating
+    | Shut
 
 
 {-| The previous process's leftovers, and when each was last written.
@@ -85,7 +100,11 @@ type alias World =
     , requests : Dict String Info
     , drained : Set String
     , left : Set String
-    , over : Set String
+    , wires : Dict String Wire
+    , pendingHeads : Dict String String
+    , headed : Set String
+    , persisted : Bool
+    , dissipated : Bool
     , clock : Int
     , moved : Dict String Int
     , injectedInto : Set String
@@ -96,32 +115,45 @@ type alias World =
     }
 
 
+{-| A server past its boot: the layout prepared, the first sweep done, and
+listening. Arrivals start from here, as they would on a real socket.
+-}
 emptyWorld : World
 emptyWorld =
     let
         ( model, boot ) =
             Server.init config
     in
-    { model = model
-    , machines = Dict.empty
-    , files = Dict.fromList (( "/d/blobs/1", "BLOBDATA" ) :: List.map (\( path, _ ) -> ( path, "left by a dead process" )) planted)
-    , mtimes = Dict.fromList (( "/d/blobs/1", -100000 ) :: planted)
-    , fds = Dict.empty
-    , responses = Dict.empty
-    , faults = []
-    , issued = 0
-    , requests = Dict.empty
-    , drained = Set.empty
-    , left = Set.empty
-    , over = Set.empty
-    , clock = 0
-    , moved = Dict.empty
-    , injectedInto = Set.empty
-    , outbox = boot
-    , halted = False
-    , sweptWhileLive = False
-    , violations = []
-    }
+    drain 5000
+        { model = model
+        , machines = Dict.empty
+        , files = Dict.fromList (( "/d/blobs/1", "BLOBDATA" ) :: List.map (\( path, _ ) -> ( path, "left by a dead process" )) planted)
+        , mtimes = Dict.fromList (( "/d/blobs/1", -100000 ) :: planted)
+        , fds = Dict.empty
+        , responses = Dict.empty
+        , faults = []
+        , issued = 0
+        , requests = Dict.empty
+        , drained = Set.empty
+        , left = Set.empty
+        , wires = Dict.empty
+        , pendingHeads = Dict.empty
+        , headed = Set.empty
+        , persisted = False
+        , dissipated = False
+        , clock = 0
+        , moved = Dict.empty
+        , injectedInto = Set.empty
+        , outbox = boot
+        , halted = False
+        , sweptWhileLive = False
+        , violations = []
+        }
+
+
+clockOf : World -> Server.Clock
+clockOf world =
+    { mono = world.clock, wall = world.clock }
 
 
 
@@ -135,7 +167,8 @@ type Choice
     | Push Int Int
     | Wait Int
     | Deliver Int
-    | Sweep
+    | Release Int
+    | HalfClose Int
 
 
 injectable : List String
@@ -160,13 +193,28 @@ choice =
         , ( 2, Fuzz.map2 Push (Fuzz.intRange 0 20) (Fuzz.intRange 0 6000) )
         , ( 2, Fuzz.map Wait (Fuzz.oneOfValues [ 50, 400, 1100, 2100, 3100 ]) )
         , ( 4, Fuzz.map Deliver (Fuzz.intRange 1 4) )
-        , ( 1, Fuzz.constant Sweep )
+        , ( 2, Fuzz.map Release (Fuzz.intRange 0 20) )
+        , ( 1, Fuzz.map HalfClose (Fuzz.intRange 0 40) )
         ]
+
+
+{-| Every request arrives on its own connection.
+-}
+connOf : Int -> String
+connOf n =
+    "k" ++ String.fromInt n
 
 
 requestId : Int -> String
 requestId n =
-    "r" ++ String.fromInt n
+    Request.idToString (Request.idWithin (Request.connIdFromString (connOf n)) 0)
+
+
+{-| The request a connection carries.
+-}
+requestOn : String -> String
+requestOn conn =
+    Request.idToString (Request.idWithin (Request.connIdFromString conn) 0)
 
 
 arrive : Int -> World -> World
@@ -209,24 +257,29 @@ arrive template world =
 
         headers =
             if info.declared then
-                [ "Content-Length", String.fromInt (String.length info.body) ]
+                [ "Content-Length: " ++ String.fromInt (String.length info.body) ]
 
             else if method == "PUT" then
                 -- chunked: no declared length, so only the stream can find it too big
-                [ "Transfer-Encoding", "chunked" ]
+                [ "Transfer-Encoding: chunked" ]
 
             else
                 []
 
-        wire =
-            Encode.object
-                [ ( "method", Encode.string method )
-                , ( "target", Encode.string target )
-                , ( "headers", Encode.list Encode.string headers )
-                ]
+        head =
+            String.join "\u{000D}\n" ((method ++ " " ++ target ++ " HTTP/1.1") :: "Host: x" :: headers) ++ "\u{000D}\n\u{000D}\n"
+
+        conn =
+            connOf world.issued
     in
-    feed (Received (Request.idFromString id) world.clock wire)
-        { world | issued = world.issued + 1, requests = Dict.insert id info world.requests }
+    -- The head waits on the socket until Elm asks the bridge to read it.
+    feed (Accepted (Request.connIdFromString conn) (clockOf world))
+        { world
+            | issued = world.issued + 1
+            , requests = Dict.insert id info world.requests
+            , wires = Dict.insert conn Open world.wires
+            , pendingHeads = Dict.insert conn head world.pendingHeads
+        }
 
 
 inFlight : World -> List ( String, Op )
@@ -265,22 +318,15 @@ apply c world =
                     world
 
         Leave i ->
-            case anyRequest i of
-                Just id ->
-                    let
-                        departed =
-                            { world | left = Set.insert id world.left }
-                    in
-                    -- The bridge reports a disconnect only while it still
-                    -- holds the exchange: before any answer was written.
-                    if Set.member id world.over then
-                        departed
+            if world.issued == 0 then
+                world
 
-                    else
-                        feed (ClientGone (Request.idFromString id)) departed
-
-                Nothing ->
-                    world
+            else
+                let
+                    n =
+                        modBy world.issued i
+                in
+                hangUp (connOf n) { world | left = Set.insert (requestId n) world.left }
 
         Push i k ->
             case pickOf (List.filter (\( _, op ) -> streaming op) (inFlight world)) i of
@@ -289,21 +335,98 @@ apply c world =
                         total =
                             Maybe.withDefault 0 (Dict.get id world.moved) + k
                     in
-                    feed (Progressed (Request.idFromString id) total True world.clock) { world | moved = Dict.insert id total world.moved }
+                    feed (Progressed (Request.idFromString id) total True (clockOf world)) { world | moved = Dict.insert id total world.moved }
 
                 Nothing ->
                     world
 
         Wait ms ->
-            feed (Tick (world.clock + ms)) { world | clock = world.clock + ms }
+            let
+                later =
+                    { world | clock = world.clock + ms }
+            in
+            feed (Woke (clockOf later)) later
 
         Deliver k ->
             deliver k world
 
-        Sweep ->
-            -- The alarm can ring at any time; the server decides whether it
-            -- means anything.
-            feed SweepDue world
+        Release i ->
+            case pickOf (closing world) i of
+                Just conn ->
+                    release conn world
+
+                Nothing ->
+                    world
+
+        HalfClose i ->
+            -- The client sends FIN and goes quiet: its socket can still be
+            -- written, but nothing more will arrive, a body included.
+            if world.issued == 0 then
+                world
+
+            else
+                let
+                    n =
+                        modBy world.issued i
+
+                    conn =
+                        connOf n
+
+                    quiet =
+                        { world | left = Set.insert (requestId n) world.left }
+                in
+                if Dict.get conn world.wires == Just Open then
+                    feed (PeerEnded (Request.connIdFromString conn) (clockOf quiet)) quiet
+
+                else
+                    quiet
+
+
+{-| Connections whose fd the bridge is closing: asked to, or dissipating.
+-}
+closing : World -> List String
+closing world =
+    Dict.toList world.wires
+        |> List.filter (\( _, wire ) -> wire == AskedToClose || wire == Dissipating)
+        |> List.map Tuple.first
+
+
+{-| The fd of a closing connection is closed; the bridge says how.
+-}
+release : String -> World -> World
+release conn world =
+    let
+        ending =
+            case Dict.get conn world.wires of
+                Just Dissipating ->
+                    Server.Dissipated Kernel.HungUp 0
+
+                _ ->
+                    Server.AsAsked
+    in
+    feed (ConnClosed (Request.connIdFromString conn) ending (clockOf world)) { world | wires = Dict.insert conn Shut world.wires }
+
+
+{-| The client closes its socket. Whatever the bridge was doing with the
+connection ends, and it says so once.
+-}
+hangUp : String -> World -> World
+hangUp conn world =
+    case Dict.get conn world.wires of
+        Just Open ->
+            feed (ConnClosed (Request.connIdFromString conn) Server.PeerLeft (clockOf world)) { world | wires = Dict.insert conn Shut world.wires }
+
+        Just AskedToClose ->
+            release conn world
+
+        Just Dissipating ->
+            release conn world
+
+        Just Shut ->
+            world
+
+        Nothing ->
+            world
 
 
 {-| Elm's instructions reach the bridge through a port mailbox, in order but
@@ -361,7 +484,7 @@ complete failure id world =
 
                         stopped =
                             if streaming op then
-                                feed (Progressed (Request.idFromString id) (Maybe.withDefault 0 (Dict.get id marked.moved)) False marked.clock) marked
+                                feed (Progressed (Request.idFromString id) (Maybe.withDefault 0 (Dict.get id marked.moved)) False (clockOf marked)) marked
 
                             else
                                 marked
@@ -703,7 +826,7 @@ transition id ( machine, reports ) world =
             case Tx.inFlight machine of
                 Just op ->
                     if streaming op && Just op /= before then
-                        feed (Progressed (Request.idFromString id) 0 True stored.clock) { stored | moved = Dict.insert id 0 stored.moved }
+                        feed (Progressed (Request.idFromString id) 0 True (clockOf stored)) { stored | moved = Dict.insert id 0 stored.moved }
 
                     else
                         stored
@@ -711,7 +834,7 @@ transition id ( machine, reports ) world =
                 Nothing ->
                     stored
     in
-    List.foldl (\r w -> feed (Reported (Server.ownerFromKey id) (Tx.encodeReport r)) w) started reports
+    List.foldl (\r w -> feed (Reported (Server.ownerFromKey id) (Tx.encodeReport r) (clockOf w)) w) started reports
 
 
 feed : Msg -> World -> World
@@ -740,28 +863,48 @@ judgeEmission jobsBefore effect world =
             { world | outbox = world.outbox ++ [ effect ] }
     in
     case effect of
-        Respond id response connection ->
+        Send conn text ->
             let
                 key =
-                    Request.idToString id
-
-                info =
-                    Dict.get key world.requests
-
-                unread =
-                    (info |> Maybe.map .declared |> Maybe.withDefault False) && not (Set.member key world.drained)
-
-                wire =
-                    Response.toWire connection response
+                    requestOn (Request.connIdToString conn)
             in
-            if unread && connection == Response.KeepAlive then
-                violate (key ++ " answered while its body was unread, without closing the connection") queued
-
-            else if wire.status == 408 && Set.member key world.drained then
+            if statusOf text == 408 && Set.member key world.drained then
                 violate (key ++ " was told its body did not arrive, after all of it had") queued
 
             else
                 queued
+
+        AwaitHead conn _ ->
+            let
+                c =
+                    Request.connIdToString conn
+
+                key =
+                    requestOn c
+
+                unread =
+                    (Dict.get key world.requests |> Maybe.map (\info -> info.body /= "") |> Maybe.withDefault False)
+                        && not (Set.member key world.drained)
+            in
+            -- The first AwaitHead reads the first head; any later one keeps
+            -- the connection for another request.
+            if Set.member c world.headed && unread then
+                violate (key ++ " kept its connection for another request while its body was unread") queued
+
+            else
+                queued
+
+        CloseConn _ ->
+            queued
+
+        Dissipate _ _ ->
+            queued
+
+        Note _ _ _ _ ->
+            queued
+
+        Alarm _ ->
+            queued
 
         Extend (Exchange id) program ->
             if not (wasWaiting (Request.idToString id)) && not (List.isEmpty (Plan.steps program)) then
@@ -772,6 +915,9 @@ judgeEmission jobsBefore effect world =
 
         Extend Janitor program ->
             List.foldl (judgeDoom world) queued (doomedBy program)
+
+        Extend (Socket _) _ ->
+            violate "a transaction was extended for a connection, which runs none" queued
 
         Begin _ _ ->
             queued
@@ -822,28 +968,67 @@ judgeDoom world path w =
         w
 
 
-{-| The bridge applies one instruction.
+statusOf : String -> Int
+statusOf text =
+    String.split " " text |> List.drop 1 |> List.head |> Maybe.andThen String.toInt |> Maybe.withDefault 0
+
+
+{-| The bridge applies one instruction. Bytes for a connection that is shut
+go nowhere; a connection's request is only ever read when Elm asks.
 -}
 carryOut : Effect -> World -> World
 carryOut effect world =
-    case effect of
-        Respond id response connection ->
-            let
-                key =
-                    Request.idToString id
+    let
+        wireOf conn =
+            Dict.get (Request.connIdToString conn) world.wires |> Maybe.withDefault Shut
 
-                wire =
-                    Response.toWire connection response
-            in
-            if Set.member key world.over || Set.member key world.left then
-                -- The exchange is gone; the bridge drops the answer.
-                { world | over = Set.insert key world.over }
+        answered key status w =
+            { w | responses = Dict.update key (\p -> Just (Maybe.withDefault [] p ++ [ status ])) w.responses }
+    in
+    case effect of
+        Send conn text ->
+            if wireOf conn == Shut then
+                world
 
             else
-                { world
-                    | responses = Dict.update key (\p -> Just (Maybe.withDefault [] p ++ [ wire.status ])) world.responses
-                    , over = Set.insert key world.over
-                }
+                answered (requestOn (Request.connIdToString conn)) (statusOf text) world
+
+        AwaitHead conn _ ->
+            let
+                c =
+                    Request.connIdToString conn
+            in
+            case ( wireOf conn, Dict.get c world.pendingHeads ) of
+                ( Open, Just head ) ->
+                    feed (HeadArrived conn head (clockOf world))
+                        { world | pendingHeads = Dict.remove c world.pendingHeads, headed = Set.insert c world.headed }
+
+                ( Open, Nothing ) ->
+                    -- Kept for a request this world never sends.
+                    { world | persisted = True }
+
+                _ ->
+                    world
+
+        CloseConn conn ->
+            if wireOf conn == Open then
+                { world | wires = Dict.insert (Request.connIdToString conn) AskedToClose world.wires }
+
+            else
+                world
+
+        Dissipate conn _ ->
+            if wireOf conn == Open then
+                { world | wires = Dict.insert (Request.connIdToString conn) Dissipating world.wires, dissipated = True }
+
+            else
+                world
+
+        Note _ _ _ _ ->
+            world
+
+        Alarm _ ->
+            world
 
         Begin owner program ->
             transition (Server.ownerKey owner) (Tx.boot (Plan.steps program) (Plan.continuation program)) world
@@ -863,25 +1048,23 @@ carryOut effect world =
                     world
 
                 streamAnswer =
-                    if
-                        List.any
+                    case
+                        List.filterMap
                             (\s ->
                                 case s of
-                                    Tx.Do (Io.Stream _) _ ->
-                                        True
+                                    Tx.Do (Io.Stream stream) _ ->
+                                        Just stream.head
 
                                     _ ->
-                                        False
+                                        Nothing
                             )
                             steps
-                    then
-                        { checked
-                            | responses = Dict.update key (\p -> Just (Maybe.withDefault [] p ++ [ 200 ])) checked.responses
-                            , over = Set.insert key checked.over
-                        }
+                    of
+                        head :: _ ->
+                            answered key (statusOf head) checked
 
-                    else
-                        checked
+                        [] ->
+                            checked
             in
             case Dict.get key streamAnswer.machines of
                 Just machine ->
@@ -952,11 +1135,16 @@ drain fuel world =
 
     else
         case inFlight world of
-            [] ->
-                world
-
             ( id, _ ) :: _ ->
                 drain (fuel - 1) (complete Nothing id world)
+
+            [] ->
+                case closing world of
+                    conn :: _ ->
+                        drain (fuel - 1) (release conn world)
+
+                    [] ->
+                        world
 
 
 simulate : List Choice -> World
@@ -965,14 +1153,13 @@ simulate choices =
         ran =
             List.foldl apply emptyWorld choices |> drain 5000
 
-        -- Long after everything: every deadline has passed, every part is
-        -- stale, and one more sweep runs.
+        -- Long after everything: every deadline has passed, idle
+        -- connections are closed, every part is stale, and one more sweep
+        -- runs.
         later =
-            ran.clock + 100000
+            { ran | clock = ran.clock + 100000 }
     in
-    drain 5000 (feed (Tick later) { ran | clock = later })
-        |> feed SweepDue
-        |> drain 5000
+    drain 5000 (feed (Woke (clockOf later)) later)
 
 
 
@@ -1102,6 +1289,8 @@ quiescent choices =
         , \w -> Expect.equal Dict.empty w.fds |> Expect.onFail "an fd (lease) leaked"
         , \w -> Expect.equal 0 (Dict.size w.model.jobs) |> Expect.onFail "a job outlived its transaction"
         , \w -> Expect.equal [] (debris w) |> Expect.onFail "parts left on disk that nobody reported"
+        , \w -> Expect.equal [] (Dict.keys w.model.conns) |> Expect.onFail "a connection outlived its fd"
+        , \w -> Expect.equal 0 (Kernel.held w.model.pool) |> Expect.onFail "a linger slot was never given back"
         , \w -> Expect.equal True (Dict.member "/d/.tmp/notes" w.files) |> Expect.onFail "the janitor removed a file that is not a part"
         , \w -> Expect.equal [] (createdButNotStored w)
         , \w -> Expect.equal [] (corruptFinals w)
@@ -1146,6 +1335,8 @@ suite =
                     , ( Test.Distribution.atLeast 3, "a body was refused for size (413)", simulate >> answeredWith 413 )
                     , ( Test.Distribution.atLeast 2, "a part was orphaned and reported", simulate >> orphanPaths >> Set.isEmpty >> not )
                     , ( Test.Distribution.atLeast 2, "the janitor removed parts while requests were live", simulate >> .sweptWhileLive )
+                    , ( Test.Distribution.atLeast 20, "a connection was dissipated", simulate >> .dissipated )
+                    , ( Test.Distribution.atLeast 20, "a connection persisted after its response", simulate >> .persisted )
                     ]
             }
             (Fuzz.listOfLengthBetween 10 90 choice)

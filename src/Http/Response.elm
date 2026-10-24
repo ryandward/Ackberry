@@ -1,9 +1,6 @@
 module Http.Response exposing
-    ( Connection(..)
-    , Failure(..)
-    , Linger
+    ( Failure(..)
     , Response
-    , Wire
     , continue
     , created
     , emptyOctets
@@ -12,9 +9,6 @@ module Http.Response exposing
     , problem
     , serialize
     , serializeStreamHead
-    , status
-    , streamHead
-    , toWire
     , utf8Length
     )
 
@@ -24,8 +18,8 @@ Success and failure are separate constructors, so a 2xx cannot carry a
 problem document and an error status cannot carry a success body. The status
 set is closed, and a 405 cannot be built without the list of allowed methods
 that RFC 9110 requires in its Allow header. Header names and values come only
-from this module, which is what keeps `res.writeHead` in the bridge from
-throwing on a bad header.
+from this module, and so does every byte the bridge writes: `serialize`
+produces the whole response.
 
 -}
 
@@ -69,38 +63,6 @@ type Failure
     | InsufficientStorage
 
 
-{-| What becomes of the connection after the response.
-
-`KeepAlive` when the request had no body, or its body was read to the end.
-
-`CloseAfter` when the request declared a body that was never fully read.
-Keeping the connection would make Node read and discard the rest of that
-body at whatever speed the client chooses. Closing it at once is no better:
-the client is still sending, the kernel answers its next bytes with a reset,
-and a client whose send fails that way can give up without reading the
-response already waiting for it (RFC 9112 section 9.6). So the bridge closes
-in stages, within the `Linger` bounds.
-
--}
-type Connection
-    = KeepAlive
-    | CloseAfter Linger
-
-
-{-| The staged close: the response, then FIN, then the client's bytes are
-read and dropped, never parsed, until the client hangs up, `deadlineMs`
-pass, or `maxBytes` have been dropped, and then the fd is closed. If
-`maxSockets` connections are lingering already, the close is immediate:
-the server's fds come before a clean answer to a client that ignored
-`Expect`.
--}
-type alias Linger =
-    { deadlineMs : Int
-    , maxBytes : Int
-    , maxSockets : Int
-    }
-
-
 ok : Encode.Value -> Response
 ok value =
     Success Ok200 (JsonValue value)
@@ -134,20 +96,6 @@ problem =
     Problem
 
 
-status : Response -> Int
-status response =
-    case response of
-        Success code _ ->
-            codeNumber code
-
-        Problem failure _ _ ->
-            failureCode failure
-
-
-{-| Status and headers for a body the bridge streams from an open file.
-The exact length goes in Content-Length and in the byte range the bridge
-reads, so a file that grows while streaming cannot overrun the framing.
--}
 streamHead : Int -> { status : Int, headers : List String }
 streamHead length =
     { status = 200
@@ -274,31 +222,14 @@ failureTitle failure =
             "Insufficient Storage"
 
 
-{-| What the bridge feeds to `res.writeHead(status, headers).end(body)`,
-and how it ends the connection afterwards. `headers` is flat
-`[name, value, name, value, ...]`, the raw form writeHead accepts, so the
-bridge never iterates or rewrites anything.
+{-| The status, the flat `[name, value, ...]` fields and the body, before
+they are put on the wire.
 -}
 type alias Wire =
     { status : Int
     , headers : List String
     , body : String
-    , linger : Maybe Linger
     }
-
-
-toWire : Connection -> Response -> Wire
-toWire connection response =
-    let
-        wire =
-            render response
-    in
-    case connection of
-        KeepAlive ->
-            wire
-
-        CloseAfter linger ->
-            { wire | headers = wire.headers ++ [ "connection", "close" ], linger = Just linger }
 
 
 render : Response -> Wire
@@ -328,7 +259,6 @@ render response =
 
                     NoOctets ->
                         ""
-            , linger = Nothing
             }
 
         Problem failure detail extensions ->
@@ -348,7 +278,6 @@ render response =
                                , ( "detail", Encode.string detail )
                                ]
                         )
-            , linger = Nothing
             }
 
 

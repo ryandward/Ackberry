@@ -94,7 +94,7 @@ async function main() {
 
     const corpses = fs.readdirSync(parts);
     assert.equal(corpses.length, 1, `one corpse expected, found ${corpses}`);
-    assert.match(corpses[0], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.part$/, 'named after the dead transaction, not after blob 9');
+    assert.match(corpses[0], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.\d+\.part$/, 'named after the dead transaction, not after blob 9');
     const corpse = path.join(parts, corpses[0]);
     const corpseBytes = fs.statSync(corpse).size;
     assert.ok(!fs.existsSync(blob9), 'nothing was committed');

@@ -4,6 +4,7 @@ module Io exposing
     , HostError
     , Op(..)
     , OpenMode(..)
+    , Reading(..)
     , classify
     , encodeHostError
     , encodeOp
@@ -14,6 +15,7 @@ module Io exposing
     , interruptible
     , outcomeDecoder
     , publicHostError
+    , reading
     , revokedError
     )
 
@@ -26,6 +28,8 @@ preemption are defined.
 
 -}
 
+import Http.Chunked as Chunked
+import Http.Request as Request exposing (ConnId, Framing)
 import Json.Decode as Decode exposing (Decoder)
 import Json.Encode as Encode
 
@@ -62,6 +66,30 @@ type OpenMode
     | ReadOnly
 
 
+{-| How the bridge reads a request body off its connection: exactly the
+bytes the head declared, or the chunked coding, decoded under the limits
+`Http.Chunked` defines.
+-}
+type Reading
+    = Exactly Int
+    | Chunks Chunked.Limits
+
+
+{-| A body with no framing is a body of no bytes (RFC 9112 section 6.3).
+-}
+reading : Chunked.Limits -> Framing -> Reading
+reading limits framing =
+    case framing of
+        Request.NoBody ->
+            Exactly 0
+
+        Request.Length n ->
+            Exactly n
+
+        Request.Chunked ->
+            Chunks limits
+
+
 type Op
     = Open { handle : Handle, mode : OpenMode, path : String }
     | Write Handle String
@@ -72,9 +100,9 @@ type Op
     | Unlink String
     | SyncDir String
     | HttpGet { url : String, maxBytes : Int }
-    | ReadBody { maxBytes : Int, sendContinue : Bool }
-    | PipeBody { handle : Handle, maxBytes : Int, sendContinue : Bool }
-    | Stream { handle : Handle, length : Int, status : Int, headers : List String }
+    | ReadBody { conn : ConnId, framing : Reading, maxBytes : Int, invite : Maybe String }
+    | PipeBody { conn : ConnId, handle : Handle, framing : Reading, maxBytes : Int, invite : Maybe String }
+    | Stream { conn : ConnId, handle : Handle, length : Int, head : String }
     | EnsureDir String
     | ListDir String
     | UnlinkEach (List String)
@@ -145,6 +173,23 @@ encodeOp op =
 
         path p =
             ( "path", Encode.string p )
+
+        connField conn =
+            ( "conn", Encode.string (Request.connIdToString conn) )
+
+        inviteField invite =
+            ( "invite", Maybe.withDefault Encode.null (Maybe.map Encode.string invite) )
+
+        framingField framing =
+            ( "framing"
+            , Encode.object <|
+                case framing of
+                    Exactly n ->
+                        [ kind "length", ( "length", Encode.int n ) ]
+
+                    Chunks limits ->
+                        [ kind "chunked", ( "maxLine", Encode.int limits.maxLine ), ( "maxTrailer", Encode.int limits.maxTrailer ) ]
+            )
     in
     Encode.object <|
         case op of
@@ -191,22 +236,28 @@ encodeOp op =
             HttpGet get ->
                 [ kind "httpGet", ( "url", Encode.string get.url ), ( "maxBytes", Encode.int get.maxBytes ) ]
 
+            -- Elm's invitation if any (100 Continue), then the body, framed
+            -- as the head declared it, into memory.
             ReadBody read ->
-                [ kind "readBody", ( "maxBytes", Encode.int read.maxBytes ), ( "sendContinue", Encode.bool read.sendContinue ) ]
+                [ kind "readBody", connField read.conn, framingField read.framing, ( "maxBytes", Encode.int read.maxBytes ), inviteField read.invite ]
 
+            -- The same, straight to the fd.
             PipeBody pipe ->
                 [ kind "pipeBody"
+                , connField pipe.conn
                 , handleField pipe.handle
+                , framingField pipe.framing
                 , ( "maxBytes", Encode.int pipe.maxBytes )
-                , ( "sendContinue", Encode.bool pipe.sendContinue )
+                , inviteField pipe.invite
                 ]
 
+            -- Elm's head, then exactly `length` bytes of the file.
             Stream stream ->
                 [ kind "stream"
+                , connField stream.conn
                 , handleField stream.handle
                 , ( "length", Encode.int stream.length )
-                , ( "status", Encode.int stream.status )
-                , ( "headers", Encode.list Encode.string stream.headers )
+                , ( "head", Encode.string stream.head )
                 ]
 
             -- mkdir -p; when it creates a directory, its parent is fsync'd so
@@ -310,8 +361,9 @@ errorCode (HostError error) =
 
 {-| The failure classes some call site has a model for. Everything else is
 `Unrecognized`, and every call site sends that to a fatal 500.
-`ACKBERRY_LIMIT` is the bridge's one invented code: a byte limit Elm set was
-exceeded mid-stream.
+The bridge invents two codes: `ACKBERRY_LIMIT`, a byte limit Elm set was
+exceeded mid-stream, and `ACKBERRY_FRAMING`, a chunked body broke its own
+framing.
 -}
 type Failure
     = NoEntry
@@ -325,6 +377,7 @@ type Failure
     | Unreachable
     | Cancelled
     | TooLarge
+    | Malformed
     | Unrecognized
 
 
@@ -393,6 +446,9 @@ classify (HostError error) =
 
         "ACKBERRY_LIMIT" ->
             TooLarge
+
+        "ACKBERRY_FRAMING" ->
+            Malformed
 
         _ ->
             Unrecognized

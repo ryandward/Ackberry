@@ -1,26 +1,34 @@
 'use strict';
 
-// The bridge: an HTTP front end, a table of host resources, and an
+// The bridge: a TCP front end, a table of host resources, and an
 // interpreter for the transaction algebra defined in src/Tx.elm.
 //
-// It decides nothing. Elm sends one ordered array of instructions per update
-// and the bridge applies them in order:
+// It decides nothing. Every connection is Elm's from its first byte: the
+// bridge reports what happens on a socket, and carries out the ordered
+// array of instructions Elm sends per update:
 //
-//   respond  write an inline response; if Elm attached a linger, close the
-//            connection in stages within its bounds
-//   begin    start a transaction: an ordered list of steps
-//   extend   append steps to a paused transaction
-//   abort    preempt a transaction
-//   log      write a fault line
-//   listen   start accepting connections (Elm sends it once the data
-//            directory's layout exists)
-//   halt     Elm refuses to serve; say why
+//   awaitHead  read until the end of a head, within Elm's byte limit
+//   send       write bytes Elm serialized
+//   close      FIN, then close once the bytes are flushed
+//   dissipate  FIN, then drop the client's bytes within Elm's bounds, then close
+//   begin      start a transaction: an ordered list of steps
+//   extend     append steps to a paused transaction
+//   abort      preempt a transaction
+//   alarm      wake Elm once, after a delay, or never
+//   listen     start accepting connections
+//   note, log  observation: a request line, a fault
+//   halt       Elm refuses to serve; say why
+//
+// Every event it reports carries the host's two clocks, read as the event
+// goes out: performance.now() for deadlines, Date.now() for dates. It keeps
+// no time of its own except the bounds Elm hands a single dissipation.
 //
 // The interpreter knows sequencing, a cleanup stack and a commit flag; it
 // does not know what any operation means. The drivers know how to perform
 // one operation each and how to sever it when its AbortSignal fires; they do
 // not know what a transaction is. tests/vm checks the interpreter against
-// Elm's reference semantics on random programs.
+// Elm's reference semantics on random programs, and tests/chunked checks the
+// chunked decoder against Elm's reference decoder.
 
 const http = require('node:http');
 const net = require('node:net');
@@ -213,9 +221,6 @@ function createInterpreter({ drivers, report, progress, reclaim, events }) {
   };
 }
 
-// ---------------------------------------------------------------------------
-// The drivers: one host primitive each.
-
 // fsync on a directory: makes its entries, not the files they name, durable.
 async function syncDirectory(dirPath) {
   const dir = await fs.open(dirPath, 'r');
@@ -226,7 +231,303 @@ async function syncDirectory(dirPath) {
   }
 }
 
-function createDrivers({ handles, exchanges, knobs }) {
+// ---------------------------------------------------------------------------
+// The chunked transfer coding (RFC 9112 section 7.1), decoded mechanically.
+// It decides nothing a chunked body could mean; it only finds where one
+// ends, and it refuses framing it cannot read rather than guess: sizes are
+// 1*HEXDIG, only whitespace before a ';' may follow them, every line ends in
+// CRLF, a size line or the trailer section past its limit is refused. It
+// must agree byte for byte with src/Http/Chunked.elm, which tests/chunked
+// checks on random and corrupted streams split at random places.
+
+const framing = (offset, why) => Object.assign(fault('FramingError', 'ACKBERRY_FRAMING', `${why} at byte ${offset}`), { offset });
+const isHex = (b) => (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x46) || (b >= 0x61 && b <= 0x66);
+const hexValue = (b) => (b <= 0x39 ? b - 0x30 : (b | 0x20) - 0x61 + 10);
+const isLineByte = (b) => b === 0x09 || (b >= 0x20 && b !== 0x7f);
+
+class ChunkedDecoder {
+  constructor({ maxLine, maxTrailer }) {
+    this.maxLine = maxLine;
+    this.maxTrailer = maxTrailer;
+    this.state = 'size';
+    this.size = 0;
+    this.digits = 0;
+    this.line = 0;
+    this.trailer = 0;
+    this.remaining = 0;
+    this.offset = 0; // bytes consumed so far, for error positions
+  }
+
+  // Consumes from `buf`. Returns the data found, how many bytes of `buf`
+  // were used, and whether the body ended; bytes after the end are not used.
+  push(buf) {
+    const data = [];
+    let i = 0;
+    while (i < buf.length && this.state !== 'done') {
+      const at = this.offset + i;
+      if (this.state === 'data') {
+        const n = Math.min(this.remaining, buf.length - i);
+        data.push(buf.subarray(i, i + n));
+        this.remaining -= n;
+        i += n;
+        if (this.remaining === 0) this.state = 'dataCR';
+        continue;
+      }
+      const b = buf[i];
+      i += 1;
+      // What the limits count, judged by the state the byte was read in: a
+      // size line's bytes up to its CR, and every byte of the trailer
+      // section through the final LF.
+      const inLine = (this.state === 'size' || this.state === 'bws' || this.state === 'ext') && b !== 0x0d;
+      const inTrailer = this.state === 'trailer' || this.state === 'trailerLine' || this.state === 'trailerLF' || this.state === 'endLF';
+      switch (this.state) {
+        case 'size':
+          if (isHex(b)) {
+            this.digits += 1;
+            if (this.digits > 13) throw framing(at, 'a chunk size longer than 13 hex digits');
+            this.size = this.size * 16 + hexValue(b);
+          } else if (this.digits === 0) {
+            throw framing(at, 'a chunk size that does not start with a hex digit');
+          } else if (b === 0x3b) {
+            this.state = 'ext';
+          } else if (b === 0x20 || b === 0x09) {
+            this.state = 'bws';
+          } else if (b === 0x0d) {
+            this.state = 'sizeLF';
+          } else {
+            throw framing(at, 'a chunk size followed by something other than an extension or CRLF');
+          }
+          break;
+        case 'bws':
+          if (b === 0x3b) this.state = 'ext';
+          else if (b !== 0x20 && b !== 0x09) throw framing(at, 'whitespace after a chunk size that no extension follows');
+          break;
+        case 'ext':
+          if (b === 0x0d) this.state = 'sizeLF';
+          else if (!isLineByte(b)) throw framing(at, 'a control character in a chunk extension');
+          break;
+        case 'sizeLF':
+          if (b !== 0x0a) throw framing(at, 'a chunk size line that does not end in CRLF');
+          if (this.size === 0) {
+            this.state = 'trailer';
+          } else {
+            this.state = 'data';
+            this.remaining = this.size;
+          }
+          this.size = 0;
+          this.digits = 0;
+          this.line = 0;
+          break;
+        case 'dataCR':
+          if (b !== 0x0d) throw framing(at, 'chunk data longer than its size');
+          this.state = 'dataLF';
+          break;
+        case 'dataLF':
+          if (b !== 0x0a) throw framing(at, 'chunk data not followed by CRLF');
+          this.state = 'size';
+          break;
+        case 'trailer':
+          if (b === 0x0d) {
+            this.state = 'endLF';
+          } else if (isLineByte(b)) {
+            this.state = 'trailerLine';
+          } else {
+            throw framing(at, 'a control character in the trailer section');
+          }
+          break;
+        case 'trailerLine':
+          if (b === 0x0d) this.state = 'trailerLF';
+          else if (!isLineByte(b)) throw framing(at, 'a control character in the trailer section');
+          break;
+        case 'trailerLF':
+          if (b !== 0x0a) throw framing(at, 'a trailer line that does not end in CRLF');
+          this.state = 'trailer';
+          break;
+        case 'endLF':
+          if (b !== 0x0a) throw framing(at, 'a chunked body that does not end in CRLF');
+          this.state = 'done';
+          break;
+        default:
+          throw framing(at, `the decoder reached ${this.state}`);
+      }
+      if (inLine) {
+        this.line += 1;
+        if (this.line > this.maxLine) throw framing(at, 'a chunk size line past its limit');
+      }
+      if (inTrailer) {
+        this.trailer += 1;
+        if (this.trailer > this.maxTrailer) throw framing(at, 'a trailer section past its limit');
+      }
+    }
+    this.offset += i;
+    return { data, used: i, done: this.state === 'done' };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Connections. The bridge reads ahead of Elm by at most READ_AHEAD bytes, so
+// a peer's FIN or reset is seen promptly, and beyond that only while a
+// reader Elm installed (a head, a body, a dissipation) wants bytes; past
+// that the socket is paused and TCP's own flow control holds the client.
+
+const READ_AHEAD = 64 * 1024;
+const CRLF = Buffer.from('\r\n', 'latin1');
+const END_OF_HEAD = Buffer.from('\r\n\r\n', 'latin1');
+
+// The first `n` queued bytes, removed from the queue.
+function take(conn, n) {
+  const parts = [];
+  let left = n;
+  while (left > 0) {
+    const first = conn.queue[0];
+    if (first.length <= left) {
+      parts.push(first);
+      conn.queue.shift();
+      left -= first.length;
+    } else {
+      parts.push(first.subarray(0, left));
+      conn.queue[0] = first.subarray(left);
+      left = 0;
+    }
+  }
+  conn.queued -= n;
+  return parts.length === 1 ? parts[0] : Buffer.concat(parts, n);
+}
+
+// Everything queued, as one buffer, left in the queue.
+function peek(conn) {
+  if (conn.queue.length > 1) conn.queue = [Buffer.concat(conn.queue, conn.queued)];
+  return conn.queue[0] ?? Buffer.alloc(0);
+}
+
+function pump(conn) {
+  if (conn.reader !== null) conn.reader.consume();
+  const hungry = conn.reader !== null && conn.reader.hungry();
+  if (!conn.holding && (hungry || conn.queued < READ_AHEAD)) conn.socket.resume();
+  else conn.socket.pause();
+}
+
+// A head: everything up to and including the empty line that ends it.
+// Empty lines before a request line are dropped (RFC 9112 section 2.2).
+function headReader(conn, maxBytes, report) {
+  return {
+    hungry: () => true,
+    consume() {
+      while (conn.queued >= 2 && peek(conn).subarray(0, 2).equals(CRLF)) take(conn, 2);
+      const view = peek(conn).subarray(0, maxBytes);
+      const end = view.indexOf(END_OF_HEAD);
+      if (end !== -1) {
+        conn.reader = null;
+        report('head', { head: take(conn, end + 4).toString('latin1') });
+      } else if (conn.queued >= maxBytes) {
+        conn.reader = null;
+        report('overflow', {});
+      } else if (conn.ended) {
+        conn.reader = null;
+      }
+    },
+    fail() {
+      conn.reader = null;
+    },
+  };
+}
+
+// A request body as a stream, read as Elm said: `length` bytes, or chunked
+// under the limits Elm gave. Destroying the stream (an abort does) lets go
+// of the socket at once.
+function bodyStream(conn, framed) {
+  const decoder = framed.kind === 'chunked' ? new ChunkedDecoder(framed) : null;
+  let remaining = framed.kind === 'length' ? framed.length : 0;
+  let finished = decoder === null && remaining === 0;
+  let wanting = false;
+  let reader = null;
+  const stream = new Readable({
+    highWaterMark: 64 * 1024,
+    read() {
+      wanting = true;
+      pump(conn);
+    },
+    destroy(err, done) {
+      if (conn.reader === reader) conn.reader = null;
+      pump(conn);
+      done(err);
+    },
+  });
+  reader = {
+    hungry: () => wanting && !finished,
+    consume() {
+      try {
+        while (wanting && !finished && conn.queued > 0) {
+          if (decoder !== null) {
+            const out = decoder.push(peek(conn));
+            take(conn, out.used);
+            for (const piece of out.data) wanting = stream.push(piece);
+            finished = out.done;
+          } else {
+            const piece = take(conn, Math.min(remaining, conn.queued));
+            remaining -= piece.length;
+            finished = remaining === 0;
+            wanting = stream.push(piece);
+          }
+        }
+      } catch (err) {
+        conn.reader = null;
+        stream.destroy(err);
+        return;
+      }
+      if (finished) {
+        conn.reader = null;
+        stream.push(null);
+      } else if (conn.ended && conn.queued === 0) {
+        conn.reader = null;
+        stream.destroy(fault('Error', 'ERR_STREAM_PREMATURE_CLOSE', 'the client ended its side before the body did'));
+      }
+    },
+    fail(err) {
+      conn.reader = null;
+      stream.destroy(err);
+    },
+  };
+  if (finished) stream.push(null);
+  else conn.reader = reader;
+  return stream;
+}
+
+// Writes to a socket with its backpressure, and never ends it: what happens
+// to the connection after a download is Elm's to say.
+function socketSink(socket) {
+  let pending = null;
+  const settle = (err) => {
+    if (pending === null) return;
+    const { done, onDrain, onClose } = pending;
+    pending = null;
+    socket.off('drain', onDrain);
+    socket.off('close', onClose);
+    done(err);
+  };
+  return new Writable({
+    highWaterMark: 64 * 1024,
+    write(chunk, _encoding, done) {
+      if (socket.destroyed) return done(fault('Error', 'ECONNRESET', 'the client went away'));
+      if (socket.write(chunk)) return done();
+      const onDrain = () => settle();
+      const onClose = () => settle(fault('Error', 'ECONNRESET', 'the client went away'));
+      pending = { done, onDrain, onClose };
+      socket.once('drain', onDrain);
+      socket.once('close', onClose);
+      return undefined;
+    },
+    destroy(err, done) {
+      settle(err ?? fault('AbortError', 'ABORT_ERR', 'This operation was aborted'));
+      done(err);
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The drivers: one host primitive each.
+
+function createDrivers({ handles, conns, knobs }) {
   // Fault injection for tests: a slow device. Deliberately not abortable,
   // because a slow syscall is not abortable either.
   const disk = (run) => async (op, ctx) => {
@@ -241,10 +542,10 @@ function createDrivers({ handles, exchanges, knobs }) {
     return fh;
   };
 
-  const exchange = (ctx) => {
-    const ex = exchanges.get(ctx.request);
-    if (ex === undefined) throw fault('Error', 'ECONNRESET', 'the client disconnected before this step ran');
-    return ex;
+  const connection = (id) => {
+    const conn = conns.get(id);
+    if (conn === undefined || conn.socket.destroyed) throw fault('Error', 'ECONNRESET', 'the client disconnected before this step ran');
+    return conn;
   };
 
   const flags = (names) => names.reduce((acc, name) => {
@@ -253,18 +554,18 @@ function createDrivers({ handles, exchanges, knobs }) {
   }, 0);
 
   // Counts bytes, enforces Elm's limit, hashes if asked, and reports the
-  // count with the time it was taken. Reports are throttled to one per
-  // PROGRESS_EVERY_MS, and a throttled chunk schedules a trailing report, so
-  // no byte goes unreported for longer than that. The first report (0 bytes)
-  // starts Elm's meter at the bridge's clock.
+  // count; the report is stamped with both clocks as it goes out. Reports are
+  // throttled to one per PROGRESS_EVERY_MS, and a throttled chunk schedules a
+  // trailing report, so no byte goes unreported for longer than that. The
+  // first report (0 bytes) starts Elm's meter.
   const meter = (ctx, limit, hashing) => {
     let bytes = 0;
     let last = 0;
     let trailing = null;
     const digest = hashing ? createHash('sha256') : null;
     const report = (running) => {
-      last = Date.now();
-      ctx.progress(bytes, running, last);
+      last = performance.now();
+      ctx.progress(bytes, running);
     };
     report(true);
     const tap = new Transform({
@@ -272,7 +573,7 @@ function createDrivers({ handles, exchanges, knobs }) {
         bytes += chunk.length;
         if (limit !== null && bytes > limit) return done(fault('LimitExceeded', 'ACKBERRY_LIMIT', `more than ${limit} bytes`));
         digest?.update(chunk);
-        const wait = last + PROGRESS_EVERY_MS - Date.now();
+        const wait = last + PROGRESS_EVERY_MS - performance.now();
         if (wait <= 0) report(true);
         else if (trailing === null) {
           trailing = setTimeout(() => {
@@ -295,6 +596,13 @@ function createDrivers({ handles, exchanges, knobs }) {
     };
   };
 
+  // Elm's invitation, if it sent one (100 Continue), then the body.
+  const body = (op) => {
+    const conn = connection(op.conn);
+    if (op.invite !== null) conn.socket.write(Buffer.from(op.invite, 'latin1'));
+    return bodyStream(conn, op.framing);
+  };
+
   function httpGet(op, ctx) {
     return new Promise((resolve, reject) => {
       const req = http.get(op.url, { signal: ctx.signal, agent: false }, (res) => {
@@ -305,16 +613,16 @@ function createDrivers({ handles, exchanges, knobs }) {
           if (bytes <= op.maxBytes) chunks.push(chunk);
         });
         res.on('end', () => {
-          let body;
-          if (bytes > op.maxBytes) body = { tag: 'tooLarge', limit: op.maxBytes };
+          let text;
+          if (bytes > op.maxBytes) text = { tag: 'tooLarge', limit: op.maxBytes };
           else {
             try {
-              body = { tag: 'text', text: utf8.decode(Buffer.concat(chunks)) };
+              text = { tag: 'text', text: utf8.decode(Buffer.concat(chunks)) };
             } catch {
-              body = { tag: 'notUtf8' };
+              text = { tag: 'notUtf8' };
             }
           }
-          resolve({ status: res.statusCode, body });
+          resolve({ status: res.statusCode, body: text });
         });
         res.on('error', reject);
         res.on('close', () => reject(res.errored ?? new Error('upstream response closed before its end')));
@@ -407,13 +715,12 @@ function createDrivers({ handles, exchanges, knobs }) {
     httpGet,
     // The request body, read into memory: only for small bodies Elm must see.
     readBody: async (op, ctx) => {
-      const { req, res } = exchange(ctx);
-      if (op.sendContinue) res.writeContinue();
+      const source = body(op);
       const m = meter(ctx, op.maxBytes, false);
       const chunks = [];
       try {
         const sink = new Writable({ write(chunk, _encoding, done) { chunks.push(chunk); done(); } });
-        await pipeline(req, m.tap, sink, { signal: ctx.signal });
+        await pipeline(source, m.tap, sink, { signal: ctx.signal });
       } finally {
         m.stop();
       }
@@ -424,112 +731,34 @@ function createDrivers({ handles, exchanges, knobs }) {
       }
     },
     // The request body, socket straight to disk. Nothing is buffered beyond
-    // the streams' high-water marks; aborting destroys the socket and the
-    // write stream, and the fd stays open for the transaction's cleanup.
+    // the streams' high-water marks; an abort destroys the body stream,
+    // which lets go of the socket, and the fd stays open for the cleanup.
     pipeBody: async (op, ctx) => {
-      const { req, res } = exchange(ctx);
+      const source = body(op);
       const fh = handle(op.handle);
-      if (op.sendContinue) res.writeContinue();
       const m = meter(ctx, op.maxBytes, true);
       try {
-        await pipeline(req, m.tap, fileSink(fh), { signal: ctx.signal });
+        await pipeline(source, m.tap, fileSink(fh), { signal: ctx.signal });
       } finally {
         m.stop();
       }
       return { bytes: m.bytes(), sha256: m.sha256() };
     },
-    // A file as the response body. This step answers the client, so it
-    // takes the exchange; the fd stays open for the transaction's cleanup.
+    // A file as the response body: Elm's head, then exactly `length` bytes.
+    // The fd stays open for the transaction's cleanup.
     stream: async (op, ctx) => {
-      const { res } = exchange(ctx);
-      exchanges.delete(ctx.request);
+      const conn = connection(op.conn);
       const fh = handle(op.handle);
-      res.writeHead(op.status, op.headers);
+      conn.socket.write(Buffer.from(op.head, 'latin1'));
       const m = meter(ctx, null, false);
       try {
-        await pipeline(fileSource(fh, op.length), m.tap, res, { signal: ctx.signal });
+        await pipeline(fileSource(fh, op.length), m.tap, socketSink(conn.socket), { signal: ctx.signal });
       } finally {
         m.stop();
       }
       return { bytes: m.bytes() };
     },
   };
-}
-
-// ---------------------------------------------------------------------------
-// The staged close of RFC 9112 section 9.6, for a response that ends a
-// connection whose request body was never read.
-//
-// Node closes such a connection as soon as the response is flushed, and
-// that loses answers: the client is still sending, the kernel answers its
-// next bytes with a reset, and a client whose send fails that way can give
-// up without reading the response already in its receive queue. So the
-// close happens in stages: the response, then FIN, then the client's bytes
-// are read and dropped, never parsed, until it hangs up or one of Elm's
-// bounds is crossed (a deadline, a byte budget), and only then is the fd
-// closed. Elm also caps how many connections may linger at once; past the
-// cap the close is immediate. The bridge decides none of it: it counts,
-// compares with Elm's numbers, and reports how each connection ended once
-// its fd is closed.
-
-function createLinger({ released }) {
-  const lingering = new Set();
-  const install = (socket, request, bound) => {
-    let staged = false;
-    // Node's HTTP server calls socket.destroySoon() once a response that
-    // carried "connection: close" has been flushed. This replaces it, for
-    // this one socket.
-    socket.destroySoon = function stagedClose() {
-      if (staged) return;
-      staged = true;
-      if (this.closed) {
-        released(request, 'hungUp', 0);
-        return;
-      }
-      if (this.destroyed) {
-        this.once('close', () => released(request, 'hungUp', 0));
-        return;
-      }
-      if (lingering.size >= bound.maxSockets) {
-        this.once('close', () => released(request, 'poolFull', 0));
-        net.Socket.prototype.destroySoon.call(this);
-        return;
-      }
-      lingering.add(this);
-      let discarded = 0;
-      let how = 'hungUp';
-      const cut = (why) => {
-        if (this.destroyed) return;
-        how = why;
-        this.destroy();
-      };
-      const deadline = setTimeout(() => cut('deadline'), bound.deadlineMs);
-      this.once('close', () => {
-        clearTimeout(deadline);
-        lingering.delete(this);
-        released(request, how, discarded);
-      });
-      // The client's bytes are no longer a request: take them from the HTTP
-      // parser and drop them. Adding a 'data' listener also takes the
-      // socket back from the parser's native fast path, and with it the
-      // parser's pause and resume handlers; a socket the parser had paused
-      // for backpressure would then never read again, so restart its handle
-      // the way Node's own resume handler does.
-      this.removeAllListeners('data');
-      this.on('data', (chunk) => {
-        discarded += chunk.length;
-        if (discarded >= bound.maxBytes) cut('budget');
-      });
-      this.once('end', () => cut('hungUp'));
-      this.end();
-      this.resume();
-      if (this._handle && !this._handle.reading) {
-        this._handle.reading = true;
-        this._handle.readStart();
-      }
-    };
-  };
-  return { lingering, install };
 }
 
 // ---------------------------------------------------------------------------
@@ -546,7 +775,12 @@ function start({
   uploadLimit = 4 * 1024 ** 3,
   staleAfterMs = 2 * 3600 * 1000,
   sweepEveryMs = 15 * 60 * 1000,
-  linger = { deadlineMs: 500, maxBytes: 128 * 1024, maxSockets: 64 },
+  head = { maxHeadBytes: 16 * 1024, maxTarget: 8 * 1024, maxFields: 100 },
+  headDeadlineMs = 10000,
+  idleMs = 5000,
+  tickMs = 100,
+  linger = { deadlineMs: 500, budgetBytes: 128 * 1024, maxSockets: 64 },
+  chunked = { maxLine: 8 * 1024, maxTrailer: 16 * 1024 },
   diskLatencyMs = null,
   log = console.error,
 }) {
@@ -563,16 +797,21 @@ function start({
       progressEveryMs: PROGRESS_EVERY_MS,
       staleAfterMs,
       sweepEveryMs,
+      head,
+      headDeadlineMs,
+      idleMs,
+      tickMs,
       linger,
+      chunked,
     },
   });
-  // requestId -> { req, res, socket }; the body is unread until a step reads
-  // it. The socket is kept apart because a step that pipes the body detaches
-  // req from it when it is severed, and the staged close still needs it.
-  const exchanges = new Map();
+  const conns = new Map(); // connection id -> { socket, queue, reader, ... }
   const handles = new Map(); // handle name -> fs.FileHandle
   const events = new EventEmitter(); // observation only; nothing here reads it
   const knobs = { diskLatencyMs };
+
+  // Every event Elm hears carries both clocks, read as it goes out.
+  const tell = (event, fields) => app.ports.fromBridge.send({ event, ...fields, mono: performance.now(), wall: Date.now() });
 
   const reclaim = async (opened) => {
     const leaked = [];
@@ -591,62 +830,132 @@ function start({
   };
 
   const vm = createInterpreter({
-    drivers: createDrivers({ handles, exchanges, knobs }),
-    report: (request, report) => app.ports.txReported.send([request, report]),
-    progress: (request, bytes, running, at) => app.ports.txProgress.send({ request, bytes, running, at }),
+    drivers: createDrivers({ handles, conns, knobs }),
+    report: (tx, report) => tell('report', { tx, report }),
+    progress: (tx, bytes, running) => tell('progress', { tx, bytes, running }),
     reclaim,
     events,
   });
 
-  const lingers = createLinger({
-    released: (request, how, discarded) => {
-      events.emit('linger', { request, how, discarded, at: now() });
-      app.ports.connectionReleased.send([request, { how, discarded }]);
-    },
-  });
-
-  // A miss is legitimate: the client can leave while the instruction sits in
-  // Elm's port mailbox. Ids are never reused, so nothing else can be hit.
-  const respond = ({ request, status, headers, body, linger }) => {
-    const ex = exchanges.get(request);
-    if (ex === undefined) return;
-    exchanges.delete(request);
-    if (linger !== null) lingers.install(ex.socket, request, linger);
-    ex.res.writeHead(status, headers).end(body);
-  };
-
-  const onRequest = (req, res) => {
+  const accept = (socket) => {
     const id = randomUUID();
-    exchanges.set(id, { req, res, socket: req.socket });
-    // Not req 'close': since Node 16 it fires once the body has been read.
-    // res 'close' fires when the response finished or the connection died;
-    // only a death leaves the id in the map.
-    res.on('close', () => {
-      if (exchanges.delete(id)) {
-        events.emit('disconnect', { request: id, at: now() });
-        app.ports.clientDisconnected.send(id);
-      }
+    const conn = { id, socket, queue: [], queued: 0, reader: null, ended: false, closing: null, holding: false, discarded: 0, left: false };
+    const leaving = () => {
+      if (conn.left) return;
+      conn.left = true;
+      events.emit('disconnect', { conn: id, at: now() });
+    };
+    conns.set(id, conn);
+    socket.setNoDelay(true);
+    socket.on('data', (chunk) => {
+      conn.queue.push(chunk);
+      conn.queued += chunk.length;
+      pump(conn);
     });
-    events.emit('request', { request: id, method: req.method, target: req.url });
-    app.ports.incomingRequest.send([id, Date.now(), { method: req.method, target: req.url, headers: req.rawHeaders }]);
+    socket.on('end', () => {
+      conn.ended = true;
+      if (conn.closing === null) {
+        leaving();
+        tell('ended', { conn: id });
+      }
+      pump(conn);
+    });
+    socket.on('error', () => {}); // the close that follows says what happened
+    socket.on('close', () => {
+      conns.delete(id);
+      if (conn.reader !== null) conn.reader.fail(fault('Error', 'ECONNRESET', 'the client went away'));
+      const how = conn.closing ?? 'peer';
+      if (how === 'peer') leaving();
+      events.emit('released', { conn: id, how, discarded: conn.discarded, at: now() });
+      tell('closed', { conn: id, how, discarded: conn.discarded });
+    });
+    events.emit('accepted', { conn: id, at: now() });
+    tell('accepted', { conn: id });
+    pump(conn);
   };
 
-  const server = http.createServer(onRequest);
-  // Without this, Node answers "100 Continue" on Elm's behalf and the client
-  // starts sending a body Elm may be about to refuse.
-  server.on('checkContinue', onRequest);
-  // Elm's janitor keeps a timer while the server serves; this lets it go.
-  server.on('close', () => app.ports.serverClosed.send(null));
+  const close = (conn) => {
+    conn.closing = 'asked';
+    conn.socket.end();
+    if (conn.socket.writableFinished) conn.socket.destroy();
+    else conn.socket.once('finish', () => conn.socket.destroy());
+  };
 
-  // Elm's init instructions arrive after this subscription, never before:
-  // its outgoing port manager starts with a zero-delay sleep.
+  // The staged close of RFC 9112 section 9.6: FIN after the response, then
+  // the client's bytes are read and dropped, never parsed, until it hangs up
+  // or one of Elm's bounds is crossed. At the budget, cut closes at once and
+  // hold stops reading until the deadline.
+  const dissipate = (conn, { deadlineMs: ms, budgetBytes, whenSpent }) => {
+    conn.closing = 'hungUp';
+    const cut = (how) => {
+      if (conn.socket.destroyed) return;
+      conn.closing = how;
+      conn.socket.destroy();
+    };
+    let spent = false;
+    const deadline = setTimeout(() => cut(spent ? 'budget' : 'deadline'), ms);
+    conn.socket.once('close', () => clearTimeout(deadline));
+    conn.reader = {
+      hungry: () => !spent,
+      consume() {
+        if (!spent && conn.queued > 0) {
+          conn.discarded += conn.queued;
+          take(conn, conn.queued);
+          if (conn.discarded >= budgetBytes) {
+            spent = true;
+            if (whenSpent === 'cut') cut('budget');
+            else {
+              conn.closing = 'budget';
+              conn.holding = true;
+            }
+          }
+        }
+        if (conn.ended && !spent) cut('hungUp');
+      },
+      fail() {
+        conn.reader = null;
+      },
+    };
+    conn.socket.end();
+    pump(conn);
+  };
+
+  let alarm = null;
+
+  const server = net.createServer({ allowHalfOpen: true, pauseOnConnect: true }, accept);
+
   app.ports.toBridge.subscribe((instructions) => {
     for (const instruction of instructions) {
+      const conn = instruction.conn === undefined ? undefined : conns.get(instruction.conn);
       switch (instruction.do) {
-        case 'respond': respond(instruction); break;
+        case 'awaitHead':
+          if (conn !== undefined && conn.closing === null) {
+            conn.reader = headReader(conn, instruction.maxBytes, (event, fields) => tell(event, { conn: conn.id, ...fields }));
+            pump(conn);
+          }
+          break;
+        case 'send':
+          if (conn !== undefined && !conn.socket.destroyed) conn.socket.write(Buffer.from(instruction.text, 'utf8'));
+          break;
+        case 'close':
+          if (conn !== undefined && conn.closing === null) close(conn);
+          break;
+        case 'dissipate':
+          if (conn !== undefined && conn.closing === null) dissipate(conn, instruction);
+          break;
         case 'begin': vm.begin(instruction); break;
         case 'extend': vm.extend(instruction); break;
         case 'abort': vm.abort(instruction); break;
+        case 'alarm':
+          clearTimeout(alarm);
+          alarm = instruction.inMs === null ? null : setTimeout(() => {
+            alarm = null;
+            tell('alarm', {});
+          }, instruction.inMs);
+          break;
+        case 'note':
+          events.emit('request', { request: instruction.request, conn: instruction.conn, method: instruction.method, target: instruction.target });
+          break;
         case 'log':
           events.emit('fault', instruction.fault);
           log(JSON.stringify(instruction.fault));
@@ -661,10 +970,18 @@ function start({
       }
     }
   });
-  return { server, exchanges, handles, txs: vm.txs, lingering: lingers.lingering, events, knobs };
+
+  // Stop accepting, and tell Elm, which closes connections waiting for a
+  // head and lets exchanges in flight finish.
+  const stop = () => {
+    server.close();
+    tell('serverClosed', {});
+  };
+
+  return { server, stop, conns, handles, txs: vm.txs, events, knobs };
 }
 
-module.exports = { start, createInterpreter, hostError };
+module.exports = { start, createInterpreter, hostError, ChunkedDecoder };
 
 if (require.main === module) {
   const dataDir = path.resolve(process.env.DATA_DIR ?? 'data');

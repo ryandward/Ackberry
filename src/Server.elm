@@ -1,9 +1,13 @@
 module Server exposing
     ( Answer(..)
     , Client(..)
+    , Clock
     , Config
+    , Conn
+    , ConnPhase(..)
     , Direction(..)
     , Effect(..)
+    , Ending(..)
     , Job
     , Ledger
     , Lingered
@@ -15,15 +19,28 @@ module Server exposing
     , Rate
     , Sweep(..)
     , Work(..)
+    , eventDecoder
     , init
     , maxUpstreamBytes
     , ownerFromKey
     , ownerKey
     , step
-    , sweepEvery
     )
 
-{-| The router as a pure state machine.
+{-| The server as a pure state machine, from the first byte of a connection
+to its last.
+
+The bridge owns nothing but sockets and file descriptors. It reports what
+happened (a connection was accepted, a head arrived, the peer closed, a
+step's outcome) with both of the host's clocks, and carries out what Elm
+sends: write these bytes, read the next head, close, dissipate, run this
+transaction.
+
+A connection is awaiting a head, carrying one exchange, or closing. Elm
+reads the next head only after the current response is out, so a
+connection never has two exchanges, and decides after every response
+whether the connection persists, is dissipated (its body was never read),
+or is closed.
 
 A request that touches the host becomes one transaction (see `Tx`), run by
 the bridge and held by Elm. Elm keeps three kinds of authority over it:
@@ -38,34 +55,33 @@ the bridge and held by Elm. Elm keeps three kinds of authority over it:
     body that leaves slower than its rate is aborted (a slow reader holding
     an fd).
 
-A job exists exactly while its transaction is unsettled. No hung requests,
-by construction: every job carries a deadline from the moment it begins, and
-`conclude` answers 500 if a transaction settles while its client is still
-waiting.
-
-Time is data, not timers. A job stores its deadline and its meter's next
-check as absolute instants; `Tick` (a subscription that exists only while
-jobs do) compares them with the clock. An Elm `Process.sleep` cannot be
-cancelled, so arming one per request would leave a timer alive long after
-the request is gone.
+Time is data. Every deadline (a head's, an idle connection's, a job's, a
+meter's) is a monotonic instant compared with the clock the bridge reports;
+Elm asks the bridge for one alarm at a time, every `tickMs` while anything
+has a deadline and otherwise at the janitor's next sweep, and none once the
+server has stopped and nothing is left. The wall clock is used only for the
+Date header and, by the janitor, against file mtimes.
 
 The server opens only once its layout exists: `init` begins a transaction
 that creates the parts and blob directories, and `Listen` goes out only
-when it settles cleanly. Until then the bridge is not listening, so no
-request can reach a lease whose directory is missing. The same janitor then
-collects the parts that crashed processes left behind; see THE JANITOR.
+when it settles cleanly. See THE JANITOR for the parts crashed processes
+leave behind.
 
 -}
 
 import Commit
 import Dict exposing (Dict)
 import Domain exposing (ItemId)
-import Http.Request as Request exposing (Request, RequestId)
+import Http.Chunked as Chunked
+import Http.Date as Date
+import Http.Head as Head
+import Http.Request as Request exposing (ConnId, Request, RequestId)
 import Http.Response as Response exposing (Response)
 import Http.Route as Route exposing (Route)
-import Io exposing (Handle, HostError)
+import Io exposing (HostError)
 import Json.Decode as Decode
 import Json.Encode as Encode
+import Kernel
 import Layout exposing (Layout, Part)
 import Plan
 import Tx
@@ -90,7 +106,22 @@ type alias Config =
     , progressEveryMs : Int
     , staleAfterMs : Int
     , sweepEveryMs : Int
-    , linger : Response.Linger
+    , head : Head.Limits
+    , headDeadlineMs : Int
+    , idleMs : Int
+    , tickMs : Int
+    , linger : { deadlineMs : Int, budgetBytes : Int, maxSockets : Int }
+    , chunked : Chunked.Limits
+    }
+
+
+{-| The host's two clocks, read by the bridge when it reported an event.
+`mono` (milliseconds of `performance.now()`) never jumps and times every
+deadline; `wall` (the epoch clock) can, and dates responses only.
+-}
+type alias Clock =
+    { mono : Int
+    , wall : Int
     }
 
 
@@ -99,14 +130,19 @@ type alias Model =
     , layout : Layout
     , phase : Phase
     , sweep : Sweep
-    , now : Int
+    , clock : Clock
+    , nextSweepAt : Int
+    , alarm : Maybe Int
     , jobs : Dict String Job
+    , conns : Dict String Conn
+    , pool : Kernel.Pool
     , ledger : Ledger
     }
 
 
 {-| `Stopped` is final: the layout could not be prepared, or the bridge's
-server closed. Jobs still in flight drain; nothing new is swept.
+server closed. Exchanges in flight finish and their connections close;
+nothing new is read or swept.
 -}
 type Phase
     = Booting
@@ -125,17 +161,42 @@ type Sweep
     | Idle
 
 
-{-| Who a transaction belongs to: a client's exchange, or the server.
+{-| Who a transaction or a fault belongs to: a client's exchange, the
+server's janitor, or a connection before or after any exchange on it.
 -}
 type Owner
     = Exchange RequestId
     | Janitor
+    | Socket ConnId
+
+
+{-| `served` counts the exchanges a connection has carried, and names the
+next one. `ended` is true once the peer has sent FIN: nothing more will
+arrive, so the connection cannot persist past its current exchange.
+-}
+type alias Conn =
+    { phase : ConnPhase
+    , served : Int
+    , ended : Bool
+    }
+
+
+{-| The first head must arrive within `headDeadlineMs` of the connection,
+each later one within `idleMs` of the last response. `lingering` is true
+while a dissipating connection holds a slot in the pool.
+-}
+type ConnPhase
+    = AwaitingHead { deadline : Int, idle : Bool }
+    | Exchanging RequestId
+    | Closing { lingering : Bool }
 
 
 type alias Job =
     { client : Client
+    , conn : ConnId
     , work : Work
     , body : BodyState
+    , persistence : Head.Persistence
     , meter : Maybe Meter
     , deadline : Int
     }
@@ -173,7 +234,9 @@ type alias Meter =
     }
 
 
-{-| What the transaction's next report means.
+{-| What the transaction's next report means. A download knows whether its
+connection closes after it, because its head, written before the first
+byte, says so.
 -}
 type Work
     = Echoing
@@ -181,8 +244,8 @@ type Work
     | Committing Commit.Spec
     | Fetching ItemId
     | OpeningBlob ItemId (Plan.Suspended Plan.Reading)
-    | Delivering
-    | Closing
+    | Delivering { closes : Bool }
+    | Finishing
 
 
 {-| Conservation law, true after every step:
@@ -200,14 +263,15 @@ type alias Ledger =
     , faults : Int
     , orphans : Int
     , swept : Int
+    , accepted : Int
     , lingered : Lingered
     }
 
 
-{-| How connections refused with an unread body ended (see
-`Response.Linger`): the client hung up before any bound was crossed, or the
-deadline or the byte budget cut it, or the pool was full and the close was
-immediate. And how many bytes the bridge read and dropped for them.
+{-| How connections whose body was never read ended: the client hung up
+before any bound was crossed, or the deadline or the byte budget cut it,
+or the pool was full and the close was immediate. And how many bytes the
+bridge read and dropped for them.
 -}
 type alias Lingered =
     { hungUp : Int
@@ -218,41 +282,55 @@ type alias Lingered =
     }
 
 
-{-| `Received` carries the host clock at arrival; `Tick` carries it on
-every beat; `Progressed` carries the bridge's clock at the moment it took the
-count, so a count and its index are written together (L-spec Corollary
-16.2). All are milliseconds since the epoch. `SweepDue` is the janitor's
-alarm and `Closed` is the bridge's server shutting down. `Released` comes
-once per refused connection, after its fd is closed, and is only counted:
-that connection is no longer anything the server decides about.
+{-| Every event carries the clock at the moment the bridge saw it, so an
+event and its time are written by the same producer at once (L-spec
+Corollary 16.2). `Woke` is the alarm Elm set. `Garbled` is an event that
+does not decode, which no state may absorb silently.
 -}
 type Msg
-    = Received RequestId Int Decode.Value
-    | ClientGone RequestId
-    | Reported Owner Decode.Value
-    | Progressed RequestId Int Bool Int
-    | Tick Int
-    | SweepDue
-    | Closed
-    | Released RequestId Decode.Value
+    = Accepted ConnId Clock
+    | HeadArrived ConnId String Clock
+    | HeadOverflow ConnId Clock
+    | PeerEnded ConnId Clock
+    | ConnClosed ConnId Ending Clock
+    | Reported Owner Decode.Value Clock
+    | Progressed RequestId Int Bool Clock
+    | Woke Clock
+    | ServerClosed Clock
+    | Garbled String
+
+
+{-| How a connection's fd came to be closed: by the peer while the server
+still held it, as the server asked, or at the end of a dissipation (with
+the bytes it dropped).
+-}
+type Ending
+    = PeerLeft
+    | AsAsked
+    | Dissipated Kernel.Release Int
 
 
 {-| Each becomes one entry in the single ordered instruction array `Main`
 sends per update.
 -}
 type Effect
-    = Respond RequestId Response Response.Connection
+    = Send ConnId String
+    | AwaitHead ConnId Int
+    | CloseConn ConnId
+    | Dissipate ConnId Kernel.Dissipation
     | Begin Owner Plan.Program
     | Extend Owner Plan.Program
     | Abort RequestId
     | Report Owner Fault
+    | Note RequestId ConnId String String
+    | Alarm (Maybe Int)
     | Listen
     | Halt String
 
 
-{-| A transaction's name on the wire. A request's is its request id, which
-the bridge mints with `randomUUID`; "janitor" is not a UUID, so the two
-names can never meet, and `ownerFromKey` inverts `ownerKey`.
+{-| A transaction's or a fault's name on the wire. A request's is
+`<connection uuid>.<n>`; "janitor" and "socket <uuid>" can be neither, so
+`ownerFromKey` inverts `ownerKey`.
 -}
 ownerKey : Owner -> String
 ownerKey owner =
@@ -263,28 +341,91 @@ ownerKey owner =
         Janitor ->
             "janitor"
 
+        Socket conn ->
+            "socket " ++ Request.connIdToString conn
+
 
 ownerFromKey : String -> Owner
 ownerFromKey name =
     if name == "janitor" then
         Janitor
 
+    else if String.startsWith "socket " name then
+        Socket (Request.connIdFromString (String.dropLeft 7 name))
+
     else
         Exchange (Request.idFromString name)
 
 
-{-| How often the janitor's alarm should ring, if it should: only while
-serving and between sweeps. Like `Tick`, it is a subscription that exists
-only while it has work, so a closed server leaves no timer behind.
--}
-sweepEvery : Model -> Maybe Int
-sweepEvery model =
-    case ( model.phase, model.sweep ) of
-        ( Serving, Idle ) ->
-            Just model.config.sweepEveryMs
+eventDecoder : Decode.Decoder Msg
+eventDecoder =
+    let
+        clock =
+            Decode.map2 Clock
+                (Decode.field "mono" (Decode.map floor Decode.float))
+                (Decode.field "wall" Decode.int)
 
-        _ ->
-            Nothing
+        conn =
+            Decode.field "conn" (Decode.map Request.connIdFromString Decode.string)
+
+        ending =
+            Decode.map2 Tuple.pair (Decode.field "how" Decode.string) (Decode.field "discarded" Decode.int)
+                |> Decode.andThen
+                    (\( how, bytes ) ->
+                        case how of
+                            "peer" ->
+                                Decode.succeed PeerLeft
+
+                            "asked" ->
+                                Decode.succeed AsAsked
+
+                            _ ->
+                                case Kernel.releaseFromString how of
+                                    Just release ->
+                                        Decode.succeed (Dissipated release bytes)
+
+                                    Nothing ->
+                                        Decode.fail ("no such ending: " ++ how)
+                    )
+    in
+    Decode.field "event" Decode.string
+        |> Decode.andThen
+            (\event ->
+                case event of
+                    "accepted" ->
+                        Decode.map2 Accepted conn clock
+
+                    "head" ->
+                        Decode.map3 HeadArrived conn (Decode.field "head" Decode.string) clock
+
+                    "overflow" ->
+                        Decode.map2 HeadOverflow conn clock
+
+                    "ended" ->
+                        Decode.map2 PeerEnded conn clock
+
+                    "closed" ->
+                        Decode.map3 ConnClosed conn ending clock
+
+                    "report" ->
+                        Decode.map3 Reported (Decode.field "tx" (Decode.map ownerFromKey Decode.string)) (Decode.field "report" Decode.value) clock
+
+                    "progress" ->
+                        Decode.map4 Progressed
+                            (Decode.field "tx" (Decode.map Request.idFromString Decode.string))
+                            (Decode.field "bytes" Decode.int)
+                            (Decode.field "running" Decode.bool)
+                            clock
+
+                    "alarm" ->
+                        Decode.map Woke clock
+
+                    "serverClosed" ->
+                        Decode.map ServerClosed clock
+
+                    _ ->
+                        Decode.fail ("no such event: " ++ event)
+            )
 
 
 maxUpstreamBytes : Int
@@ -300,8 +441,12 @@ init config =
             , layout = Layout.fromDataDir config.dataDir
             , phase = Booting
             , sweep = Preparing
-            , now = 0
+            , clock = { mono = 0, wall = 0 }
+            , nextSweepAt = 0
+            , alarm = Nothing
             , jobs = Dict.empty
+            , conns = Dict.empty
+            , pool = Kernel.pool config.linger.maxSockets
             , ledger =
                 { received = 0
                 , responded = 0
@@ -312,6 +457,7 @@ init config =
                 , faults = 0
                 , orphans = 0
                 , swept = 0
+                , accepted = 0
                 , lingered = { hungUp = 0, deadlinePassed = 0, budgetSpent = 0, poolFull = 0, bytesDiscarded = 0 }
                 }
             }
@@ -329,10 +475,13 @@ misconfigured config =
     if config.staleAfterMs <= config.transferDeadlineMs then
         Just "staleAfterMs must exceed transferDeadlineMs, or the janitor could take a part from a transaction that can still commit it"
 
-    else if config.sweepEveryMs <= 0 then
-        Just "sweepEveryMs must be positive"
+    else if config.sweepEveryMs <= 0 || config.tickMs <= 0 || config.headDeadlineMs <= 0 || config.idleMs <= 0 then
+        Just "sweepEveryMs, tickMs, headDeadlineMs and idleMs must be positive"
 
-    else if config.linger.deadlineMs < 0 || config.linger.maxBytes < 0 || config.linger.maxSockets < 0 then
+    else if config.head.maxHeadBytes <= 0 || config.head.maxTarget <= 0 || config.head.maxFields <= 0 then
+        Just "the head limits must be positive"
+
+    else if config.linger.deadlineMs < 0 || config.linger.budgetBytes < 0 || config.linger.maxSockets < 0 then
         Just "the linger bounds must not be negative"
 
     else
@@ -341,65 +490,125 @@ misconfigured config =
 
 step : Msg -> Model -> ( Model, List Effect )
 step msg model =
+    let
+        clocked =
+            case clockOf msg of
+                Just clock ->
+                    { model | clock = clock }
+
+                Nothing ->
+                    model
+    in
+    rearm (handle msg clocked)
+
+
+clockOf : Msg -> Maybe Clock
+clockOf msg =
     case msg of
-        Received id at wire ->
+        Accepted _ clock ->
+            Just clock
+
+        HeadArrived _ _ clock ->
+            Just clock
+
+        HeadOverflow _ clock ->
+            Just clock
+
+        PeerEnded _ clock ->
+            Just clock
+
+        ConnClosed _ _ clock ->
+            Just clock
+
+        Reported _ _ clock ->
+            Just clock
+
+        Progressed _ _ _ clock ->
+            Just clock
+
+        Woke clock ->
+            Just clock
+
+        ServerClosed clock ->
+            Just clock
+
+        Garbled _ ->
+            Nothing
+
+
+handle : Msg -> Model -> ( Model, List Effect )
+handle msg model =
+    case msg of
+        Accepted conn _ ->
             let
                 counted =
-                    count (\l -> { l | received = l.received + 1 }) { model | now = at }
+                    count (\l -> { l | accepted = l.accepted + 1 }) model
             in
-            case Request.fromWire wire of
-                Err rejection ->
-                    -- Nothing is known about this request's body; close.
-                    answerNow id Unread (rejectWire rejection) counted
-
-                Ok request ->
-                    -- Routes see the model before this request is counted, so
-                    -- /stats reports a ledger that balances.
-                    begin id (declaredBody request) (route model id request) counted
-
-        ClientGone id ->
-            withJob id model <|
-                \job ->
-                    case job.client of
-                        Waiting ->
-                            ( model
-                                |> putJob id { job | client = Gone }
-                                |> count (\l -> { l | abandoned = l.abandoned + 1, aborted = l.aborted + 1 })
-                            , [ Abort id ]
-                            )
-
-                        Answered ->
-                            ( model, [] )
-
-                        Gone ->
-                            ( model, [] )
-
-        SweepDue ->
-            case ( model.phase, model.sweep ) of
-                ( Serving, Idle ) ->
-                    let
-                        ( program, suspended ) =
-                            Plan.fresh |> Plan.survey model.layout |> Plan.suspend
-                    in
-                    ( { model | sweep = Surveying suspended }, [ Begin Janitor program ] )
+            case model.phase of
+                Serving ->
+                    ( putConn conn { phase = AwaitingHead { deadline = model.clock.mono + model.config.headDeadlineMs, idle = False }, served = 0, ended = False } counted
+                    , [ AwaitHead conn model.config.head.maxHeadBytes ]
+                    )
 
                 _ ->
-                    -- An alarm already queued when the last sweep began or
-                    -- the server stopped.
-                    ( model, [] )
+                    -- The listener is closing: nothing new is served.
+                    ( putConn conn { phase = Closing { lingering = False }, served = 0, ended = False } counted, [ CloseConn conn ] )
 
-        Closed ->
-            ( { model | phase = Stopped }, [] )
+        HeadArrived conn text _ ->
+            withConn conn model <|
+                \c ->
+                    case c.phase of
+                        AwaitingHead _ ->
+                            arrive conn c text model
 
-        Released id value ->
-            case Decode.decodeValue releaseDecoder value of
-                Ok ( how, bytes ) ->
-                    ( count (\l -> { l | lingered = tally how bytes l.lingered }) model, [] )
+                        Closing _ ->
+                            -- Read under an instruction sent before Elm chose
+                            -- to close: the two crossed, and the close stands.
+                            ( model, [] )
 
-                Err error ->
-                    report (Exchange id) [ Anomaly ("a connection release that does not decode: " ++ Decode.errorToString error) ] model
+                        Exchanging _ ->
+                            report (Socket conn) [ Anomaly "a head arrived while the connection carried an exchange" ] model
 
-        Progressed id bytes running at ->
+        HeadOverflow conn _ ->
+            withConn conn model <|
+                \c ->
+                    case c.phase of
+                        AwaitingHead _ ->
+                            refuseHead conn
+                                c
+                                (Response.problem Response.HeaderFieldsTooLarge
+                                    ("the request head did not end within " ++ String.fromInt model.config.head.maxHeadBytes ++ " bytes")
+                                    []
+                                )
+                                model
+
+                        Closing _ ->
+                            ( model, [] )
+
+                        Exchanging _ ->
+                            report (Socket conn) [ Anomaly "a head overflowed while the connection carried an exchange" ] model
+
+        PeerEnded conn _ ->
+            withConn conn model <|
+                \c ->
+                    case c.phase of
+                        AwaitingHead _ ->
+                            -- Nothing more will arrive, so no head will complete.
+                            ( putConn conn { c | ended = True, phase = Closing { lingering = False } } model, [ CloseConn conn ] )
+
+                        Exchanging id ->
+                            -- A client that ends its side mid-exchange has left:
+                            -- its work is aborted, as if it had closed.
+                            clientGone id (putConn conn { c | ended = True } model)
+
+                        Closing _ ->
+                            ( putConn conn { c | ended = True } model, [] )
+
+        ConnClosed conn ending _ ->
+            withConn conn model <|
+                \c -> closed conn c ending model
+
+        Progressed id bytes running clock ->
             withJob id model <|
                 \job ->
                     case job.meter of
@@ -416,7 +625,7 @@ step msg model =
                                                 { meter
                                                     | running = True
                                                     , moved = bytes
-                                                    , checkAt = at + meter.rate.perMs
+                                                    , checkAt = clock.mono + meter.rate.perMs
                                                     , required = bytes + meter.rate.bytes
                                                 }
                                     }
@@ -427,19 +636,52 @@ step msg model =
                             else
                                 ( putJob id { job | meter = Just { meter | running = running, moved = bytes } } model, [] )
 
-        Tick now ->
-            Dict.foldl
-                (\owner _ ( m, effects ) ->
-                    let
-                        ( next, more ) =
-                            expire (Request.idFromString owner) m
-                    in
-                    ( next, effects ++ more )
-                )
-                ( { model | now = now }, [] )
-                model.jobs
+        Woke _ ->
+            let
+                woken =
+                    { model | alarm = Nothing }
 
-        Reported Janitor value ->
+                ( afterJobs, jobEffects ) =
+                    Dict.foldl
+                        (\owner _ ( m, effects ) ->
+                            let
+                                ( next, more ) =
+                                    expire (Request.idFromString owner) m
+                            in
+                            ( next, effects ++ more )
+                        )
+                        ( woken, [] )
+                        woken.jobs
+
+                ( afterConns, connEffects ) =
+                    expireConns afterJobs
+
+                ( afterSweep, sweepEffects ) =
+                    sweepIfDue afterConns
+            in
+            ( afterSweep, jobEffects ++ connEffects ++ sweepEffects )
+
+        ServerClosed _ ->
+            -- Exchanges in flight finish; connections waiting for a head
+            -- are closed now rather than at their deadlines.
+            Dict.foldl
+                (\k c ( m, effects ) ->
+                    case c.phase of
+                        AwaitingHead _ ->
+                            ( putConn (Request.connIdFromString k) { c | phase = Closing { lingering = False } } m
+                            , effects ++ [ CloseConn (Request.connIdFromString k) ]
+                            )
+
+                        _ ->
+                            ( m, effects )
+                )
+                ( { model | phase = Stopped }, [] )
+                model.conns
+
+        Garbled detail ->
+            report Janitor [ Anomaly ("an event from the bridge that does not decode: " ++ detail) ] model
+
+        Reported Janitor value _ ->
             case Decode.decodeValue Tx.reportDecoder value of
                 Ok txReport ->
                     janitorReported txReport model
@@ -447,7 +689,10 @@ step msg model =
                 Err error ->
                     janitorBroke ("a report that does not decode: " ++ Decode.errorToString error) model
 
-        Reported (Exchange id) value ->
+        Reported (Socket conn) _ _ ->
+            report (Socket conn) [ Anomaly "a transaction report for a connection, which runs none" ] model
+
+        Reported (Exchange id) value _ ->
             case Dict.get (key id) model.jobs of
                 Nothing ->
                     report (Exchange id) [ Anomaly "a report for a transaction nobody holds" ] model
@@ -467,13 +712,453 @@ step msg model =
                             ( concluded, effects ++ [ Abort id ] )
 
 
+{-| One alarm at a time: every `tickMs` while anything has a deadline,
+otherwise at the janitor's next sweep, and none once nothing is left. An
+alarm already set earlier than needed is left alone; it fires, and the
+next one is set then.
+-}
+rearm : ( Model, List Effect ) -> ( Model, List Effect )
+rearm ( model, effects ) =
+    let
+        awaiting c =
+            case c.phase of
+                AwaitingHead _ ->
+                    True
+
+                Exchanging _ ->
+                    False
+
+                Closing _ ->
+                    False
+
+        janitorIdle =
+            case model.sweep of
+                Idle ->
+                    True
+
+                _ ->
+                    False
+
+        wanted =
+            if not (Dict.isEmpty model.jobs) || List.any awaiting (Dict.values model.conns) then
+                Just (model.clock.mono + model.config.tickMs)
+
+            else if model.phase == Serving && janitorIdle then
+                Just model.nextSweepAt
+
+            else
+                Nothing
+
+        arm at =
+            ( { model | alarm = Just at }, effects ++ [ Alarm (Just (max 0 (at - model.clock.mono))) ] )
+    in
+    case ( wanted, model.alarm ) of
+        ( Nothing, Nothing ) ->
+            ( model, effects )
+
+        ( Nothing, Just _ ) ->
+            ( { model | alarm = Nothing }, effects ++ [ Alarm Nothing ] )
+
+        ( Just at, Just current ) ->
+            if current <= at then
+                ( model, effects )
+
+            else
+                arm at
+
+        ( Just at, Nothing ) ->
+            arm at
+
+
+sweepIfDue : Model -> ( Model, List Effect )
+sweepIfDue model =
+    case ( model.phase, model.sweep ) of
+        ( Serving, Idle ) ->
+            if model.clock.mono >= model.nextSweepAt then
+                let
+                    ( program, suspended ) =
+                        Plan.fresh |> Plan.survey model.layout |> Plan.suspend
+                in
+                ( { model | sweep = Surveying suspended }, [ Begin Janitor program ] )
+
+            else
+                ( model, [] )
+
+        _ ->
+            ( model, [] )
+
+
+{-| The janitor at rest, its next sweep `sweepEveryMs` from now.
+-}
+idle : Model -> Model
+idle model =
+    { model | sweep = Idle, nextSweepAt = model.clock.mono + model.config.sweepEveryMs }
+
+
+
+-- CONNECTIONS
+
+
+{-| A head is a request: it is counted as received the moment it arrives,
+answered even if it is refused.
+-}
+arrive : ConnId -> Conn -> String -> Model -> ( Model, List Effect )
+arrive conn c text model =
+    let
+        id =
+            Request.idWithin conn c.served
+
+        counted =
+            count (\l -> { l | received = l.received + 1 })
+                (putConn conn { c | phase = Exchanging id, served = c.served + 1 } model)
+    in
+    case Head.parse model.config.head text of
+        Err problem ->
+            answerNow conn { body = Unread, persistence = Head.Close } (headRefusal problem) counted
+
+        Ok head ->
+            let
+                request =
+                    Head.toRequest head
+
+                ( begun, effects ) =
+                    -- Routes see the model before this request is counted,
+                    -- so /stats reports a ledger that balances.
+                    begin id conn { body = declaredBody request, persistence = head.persistence } (route model id conn request) counted
+            in
+            ( begun, Note id conn (Request.methodToString head.method) head.target :: effects )
+
+
+{-| A head that never became a request, counted as one so the ledger
+balances: received, answered, closed.
+-}
+refuseHead : ConnId -> Conn -> Response -> Model -> ( Model, List Effect )
+refuseHead conn c response model =
+    answerNow conn
+        { body = Unread, persistence = Head.Close }
+        response
+        (count (\l -> { l | received = l.received + 1 }) (putConn conn { c | phase = Exchanging (Request.idWithin conn c.served), served = c.served + 1 } model))
+
+
+{-| The fd is closed. An exchange still waiting on it has lost its client;
+a dissipation gives back its slot and is counted.
+-}
+closed : ConnId -> Conn -> Ending -> Model -> ( Model, List Effect )
+closed conn c ending model =
+    let
+        forgotten =
+            { model | conns = Dict.remove (connKey conn) model.conns }
+
+        ( freed, faults ) =
+            case c.phase of
+                Closing { lingering } ->
+                    if lingering then
+                        case Kernel.released conn forgotten.pool of
+                            Just p ->
+                                ( { forgotten | pool = p }, [] )
+
+                            Nothing ->
+                                ( forgotten, [ Anomaly "a dissipated connection that held no slot" ] )
+
+                    else
+                        ( forgotten, [] )
+
+                AwaitingHead _ ->
+                    ( forgotten, [] )
+
+                Exchanging _ ->
+                    ( forgotten, [] )
+
+        tallied =
+            case ending of
+                Dissipated release bytes ->
+                    count (\l -> { l | lingered = tally release bytes l.lingered }) freed
+
+                PeerLeft ->
+                    freed
+
+                AsAsked ->
+                    freed
+
+        ( reported, reports ) =
+            report (Socket conn) faults tallied
+    in
+    case c.phase of
+        Exchanging id ->
+            let
+                ( gone, effects ) =
+                    clientGone id reported
+            in
+            ( gone, reports ++ effects )
+
+        AwaitingHead _ ->
+            ( reported, reports )
+
+        Closing _ ->
+            ( reported, reports )
+
+
+clientGone : RequestId -> Model -> ( Model, List Effect )
+clientGone id model =
+    withJob id model <|
+        \job ->
+            case job.client of
+                Waiting ->
+                    ( model
+                        |> putJob id { job | client = Gone }
+                        |> count (\l -> { l | abandoned = l.abandoned + 1, aborted = l.aborted + 1 })
+                    , [ Abort id ]
+                    )
+
+                Answered ->
+                    ( model, [] )
+
+                Gone ->
+                    ( model, [] )
+
+
+{-| Connections whose head is late: the first head of a connection is
+answered 408, an idle connection between requests is closed without a word.
+-}
+expireConns : Model -> ( Model, List Effect )
+expireConns model =
+    Dict.foldl
+        (\k c ( m, effects ) ->
+            let
+                conn =
+                    Request.connIdFromString k
+            in
+            case c.phase of
+                AwaitingHead wait ->
+                    if m.clock.mono < wait.deadline then
+                        ( m, effects )
+
+                    else if wait.idle then
+                        ( putConn conn { c | phase = Closing { lingering = False } } m, effects ++ [ CloseConn conn ] )
+
+                    else
+                        let
+                            ( refused, more ) =
+                                refuseHead conn
+                                    c
+                                    (Response.problem Response.RequestTimeout
+                                        ("the request head did not arrive within " ++ String.fromInt m.config.headDeadlineMs ++ " ms")
+                                        []
+                                    )
+                                    (count (\l -> { l | timedOut = l.timedOut + 1 }) m)
+                        in
+                        ( refused, effects ++ more )
+
+                Exchanging _ ->
+                    ( m, effects )
+
+                Closing _ ->
+                    ( m, effects )
+        )
+        ( model, [] )
+        model.conns
+
+
+headRefusal : Head.Problem -> Response
+headRefusal problem =
+    let
+        bad detail =
+            Response.problem Response.BadRequest detail []
+    in
+    case problem of
+        Head.MalformedRequestLine ->
+            bad "the request line is not HTTP/1.x"
+
+        Head.TargetTooLong ->
+            Response.problem Response.UriTooLong "the request target is too long" []
+
+        Head.UnsupportedVersion ->
+            Response.problem Response.VersionNotSupported "only HTTP/1.x is spoken here" []
+
+        Head.UnsupportedMethod method ->
+            Response.problem Response.NotImplemented ("method " ++ method ++ " is not implemented") [ ( "method", Encode.string method ) ]
+
+        Head.HeadTooLarge ->
+            Response.problem Response.HeaderFieldsTooLarge "the request head is too large" []
+
+        Head.MalformedField ->
+            bad "a header field is malformed"
+
+        Head.MissingHost ->
+            bad "an HTTP/1.1 request needs a Host"
+
+        Head.MultipleHosts ->
+            bad "a request may name only one Host"
+
+        Head.InvalidHost ->
+            bad "the Host or the target's authority is not a host"
+
+        Head.HostMismatch ->
+            bad "the target's authority and the Host name different hosts"
+
+        Head.InvalidContentLength ->
+            bad "Content-Length is not one non-negative integer"
+
+        Head.ContentLengthTooLarge ->
+            Response.problem Response.PayloadTooLarge "the declared body is longer than this server can count" []
+
+        Head.AmbiguousLength ->
+            bad "Content-Length beside Transfer-Encoding leaves the body's length ambiguous"
+
+        Head.FaultyFraming ->
+            bad "the transfer codings do not end in a single chunked"
+
+        Head.UnsupportedCoding ->
+            Response.problem Response.NotImplemented "chunked is the only transfer coding this server reads" []
+
+        Head.UnsupportedExpectation ->
+            Response.problem Response.ExpectationFailed "100-continue is the only expectation this server meets" []
+
+
+
+-- RESPONDING
+
+
+{-| What decides a connection's fate after a response.
+-}
+type alias Disposition =
+    { body : BodyState
+    , persistence : Head.Persistence
+    }
+
+
+{-| A connection persists only if its body was read to the end (or there
+was none), the client asked to keep it, the client has not closed its
+side, and the server is still serving.
+-}
+persists : Model -> ConnId -> Disposition -> Bool
+persists model conn disposition =
+    disposition.body
+        /= Unread
+        && disposition.persistence
+        == Head.KeepAlive
+        && model.phase
+        == Serving
+        && (Dict.get (connKey conn) model.conns |> Maybe.map (not << .ended) |> Maybe.withDefault False)
+
+
+{-| The one way a response leaves: serialized here, written on its
+connection, then the connection's fate. A connection that is gone has
+nobody to answer.
+-}
+respond : ConnId -> Disposition -> Response -> Model -> ( Model, List Effect )
+respond conn disposition response model =
+    case Dict.get (connKey conn) model.conns of
+        Nothing ->
+            ( model, [] )
+
+        Just c ->
+            let
+                date =
+                    Date.fromMillis model.clock.wall
+            in
+            if persists model conn disposition then
+                ( putConn conn { c | phase = awaitingNext model } model
+                , [ Send conn (Response.serialize date False response), AwaitHead conn model.config.head.maxHeadBytes ]
+                )
+
+            else
+                let
+                    ( ending, next ) =
+                        closeConn conn c disposition.body model
+                in
+                ( next, Send conn (Response.serialize date True response) :: ending )
+
+
+awaitingNext : Model -> ConnPhase
+awaitingNext model =
+    AwaitingHead { deadline = model.clock.mono + model.config.idleMs, idle = True }
+
+
+{-| A connection whose body was never read is dissipated if the pool has a
+slot and closed at once if not; any other is simply closed.
+-}
+closeConn : ConnId -> Conn -> BodyState -> Model -> ( List Effect, Model )
+closeConn conn c body model =
+    case body of
+        Unread ->
+            case Kernel.dissipate { deadlineMs = model.config.linger.deadlineMs, budgetBytes = model.config.linger.budgetBytes } conn model.pool of
+                ( Kernel.Dissipating profile, taken ) ->
+                    ( [ Dissipate conn profile ], putConn conn { c | phase = Closing { lingering = True } } { model | pool = taken } )
+
+                ( Kernel.Severed, _ ) ->
+                    ( [ CloseConn conn ]
+                    , putConn conn { c | phase = Closing { lingering = False } } model
+                        |> count (\l -> { l | lingered = poolWasFull l.lingered })
+                    )
+
+        NoBody ->
+            ( [ CloseConn conn ], putConn conn { c | phase = Closing { lingering = False } } model )
+
+        Drained ->
+            ( [ CloseConn conn ], putConn conn { c | phase = Closing { lingering = False } } model )
+
+
+poolWasFull : Lingered -> Lingered
+poolWasFull lingered =
+    { lingered | poolFull = lingered.poolFull + 1 }
+
+
+tally : Kernel.Release -> Int -> Lingered -> Lingered
+tally how bytes lingered =
+    let
+        counted =
+            { lingered | bytesDiscarded = lingered.bytesDiscarded + bytes }
+    in
+    case how of
+        Kernel.HungUp ->
+            { counted | hungUp = counted.hungUp + 1 }
+
+        Kernel.DeadlinePassed ->
+            { counted | deadlinePassed = counted.deadlinePassed + 1 }
+
+        Kernel.BudgetSpent ->
+            { counted | budgetSpent = counted.budgetSpent + 1 }
+
+
+dispositionOf : Job -> Disposition
+dispositionOf job =
+    { body = job.body, persistence = job.persistence }
+
+
+{-| A download wrote its own head and bytes. If it finished and its head
+promised to keep the connection, the next head is read; otherwise the
+connection closes, which also ends a stream that was cut short.
+-}
+afterStream : ConnId -> { closes : Bool } -> Bool -> ( Model, List Effect ) -> ( Model, List Effect )
+afterStream conn streamed finished ( model, effects ) =
+    case Dict.get (connKey conn) model.conns of
+        Just c ->
+            case c.phase of
+                Exchanging _ ->
+                    if finished && not streamed.closes then
+                        ( putConn conn { c | phase = awaitingNext model } model, effects ++ [ AwaitHead conn model.config.head.maxHeadBytes ] )
+
+                    else
+                        ( putConn conn { c | phase = Closing { lingering = False } } model, effects ++ [ CloseConn conn ] )
+
+                AwaitingHead _ ->
+                    ( model, effects )
+
+                Closing _ ->
+                    ( model, effects )
+
+        Nothing ->
+            ( model, effects )
+
+
 {-| The clock reached this job: its deadline, then its meter.
 -}
 expire : RequestId -> Model -> ( Model, List Effect )
 expire id model =
     withJob id model <|
         \job ->
-            if job.client == Waiting && model.now >= job.deadline then
+            if job.client == Waiting && model.clock.mono >= job.deadline then
                 let
                     response =
                         if receiving job then
@@ -485,12 +1170,14 @@ expire id model =
                             Response.problem Response.GatewayTimeout
                                 ("no answer within " ++ String.fromInt model.config.deadlineMs ++ " ms")
                                 []
+
+                    ( answered, effects ) =
+                        model
+                            |> putJob id { job | client = Answered }
+                            |> count (\l -> { l | responded = l.responded + 1, timedOut = l.timedOut + 1, aborted = l.aborted + 1 })
+                            |> respond job.conn (dispositionOf job) response
                 in
-                ( model
-                    |> putJob id { job | client = Answered }
-                    |> count (\l -> { l | responded = l.responded + 1, timedOut = l.timedOut + 1, aborted = l.aborted + 1 })
-                , [ Respond id response (connection model.config.linger job.body), Abort id ]
-                )
+                ( answered, abortFirst id effects )
 
             else
                 case job.meter of
@@ -499,7 +1186,7 @@ expire id model =
                         -- so a window is judged only once every byte that arrived
                         -- in it must have been reported. Judging earlier reads a
                         -- stale count as the present (L-spec Theorem 14).
-                        if not meter.running || model.now < meter.checkAt + model.config.progressEveryMs then
+                        if not meter.running || model.clock.mono < meter.checkAt + model.config.progressEveryMs then
                             ( model, [] )
 
                         else if meter.moved >= meter.required then
@@ -508,7 +1195,7 @@ expire id model =
                                     | meter =
                                         Just
                                             { meter
-                                                | checkAt = model.now + meter.rate.perMs
+                                                | checkAt = model.clock.mono + meter.rate.perMs
                                                 , required = meter.moved + meter.rate.bytes
                                             }
                                 }
@@ -541,24 +1228,21 @@ tooSlow id job meter model =
     in
     case ( meter.direction, job.client ) of
         ( Inbound, Waiting ) ->
-            -- The abort is what ends the body pipe: once a response has
-            -- finished, Node stops destroying the request stream when the
-            -- socket dies, so a pipe still reading it would wait forever.
-            -- It does not end the connection (Node's pipeline detaches a
-            -- server request's socket before destroying it); the 408's
-            -- `connection: close` does that, after the client has it.
-            ( slow
-                |> putJob id { job | client = Answered, meter = Just { meter | running = False } }
-                |> count (\l -> { l | responded = l.responded + 1 })
-            , [ Respond id
-                    (Response.problem Response.RequestTimeout
-                        ("the body arrived slower than " ++ String.fromInt meter.rate.bytes ++ " bytes per " ++ String.fromInt meter.rate.perMs ++ " ms")
-                        [ ( "bytesReceived", Encode.int meter.moved ) ]
-                    )
-                    (connection model.config.linger job.body)
-              , Abort id
-              ]
-            )
+            -- The 408 goes out first, then the abort severs the body step,
+            -- which lets go of the socket before the dissipation takes it.
+            let
+                ( answered, effects ) =
+                    slow
+                        |> putJob id { job | client = Answered, meter = Just { meter | running = False } }
+                        |> count (\l -> { l | responded = l.responded + 1 })
+                        |> respond job.conn
+                            (dispositionOf job)
+                            (Response.problem Response.RequestTimeout
+                                ("the body arrived slower than " ++ String.fromInt meter.rate.bytes ++ " bytes per " ++ String.fromInt meter.rate.perMs ++ " ms")
+                                [ ( "bytesReceived", Encode.int meter.moved ) ]
+                            )
+            in
+            ( answered, abortFirst id effects )
 
         ( Inbound, Answered ) ->
             ( model, [] )
@@ -569,6 +1253,20 @@ tooSlow id job meter model =
         ( Outbound, _ ) ->
             -- The status line is long gone; all that is left is the fd.
             ( putJob id { job | meter = Just { meter | running = False } } slow, [ Abort id ] )
+
+
+{-| The answer's bytes, then the abort that frees the socket from the
+body step, then the connection's fate: a dissipation must not start
+reading while a body step still is.
+-}
+abortFirst : RequestId -> List Effect -> List Effect
+abortFirst id effects =
+    case effects of
+        (Send conn text) :: fate ->
+            Send conn text :: Abort id :: fate
+
+        _ ->
+            effects ++ [ Abort id ]
 
 
 
@@ -592,7 +1290,7 @@ react id job txReport model =
                         Just next ->
                             let
                                 ( answered, afterAnswer, answering ) =
-                                    applyAnswer id next.answer drainedJob model
+                                    applyAnswer next.answer drainedJob model
                             in
                             ( putJob id { answered | work = next.work, meter = next.meter } afterAnswer
                             , answering ++ [ Extend (Exchange id) next.program ]
@@ -616,8 +1314,16 @@ react id job txReport model =
             let
                 ( reply, faults ) =
                     judge drainedJob txReport
+
+                concluded =
+                    conclude id drainedJob reply (generic ++ faults) model
             in
-            conclude id drainedJob reply (generic ++ faults) model
+            case drainedJob.work of
+                Delivering streamed ->
+                    afterStream drainedJob.conn streamed (List.all isOk txReport.steps) concluded
+
+                _ ->
+                    concluded
 
 
 {-| A transaction that settled: answer if anyone is waiting, and never
@@ -630,7 +1336,7 @@ conclude id job reply faults model =
             report (Exchange id) faults model
 
         ( answered, afterAnswer, answering ) =
-            applyAnswer id (Maybe.map Inline reply |> Maybe.withDefault Unanswered) job reported
+            applyAnswer (Maybe.map Inline reply |> Maybe.withDefault Unanswered) job reported
 
         ( settled, fallback ) =
             case answered.client of
@@ -638,18 +1344,35 @@ conclude id job reply faults model =
                     let
                         ( m, fx ) =
                             report (Exchange id) [ Anomaly "a transaction settled without answering its client" ] afterAnswer
+
+                        ( responded, sent ) =
+                            respond job.conn (dispositionOf answered) (Response.problem Response.InternalServerError "the request ended without an answer" []) (count (\l -> { l | responded = l.responded + 1 }) m)
                     in
-                    ( count (\l -> { l | responded = l.responded + 1 }) m
-                    , fx ++ [ Respond id (Response.problem Response.InternalServerError "the request ended without an answer" []) (connection model.config.linger answered.body) ]
-                    )
+                    ( responded, fx ++ sent )
 
                 Answered ->
                     ( afterAnswer, [] )
 
                 Gone ->
-                    ( afterAnswer, [] )
+                    -- Nobody to answer: a connection still carrying this
+                    -- exchange (its peer only half-closed) is closed now.
+                    abandon job.conn id afterAnswer
     in
     ( { settled | jobs = Dict.remove (key id) settled.jobs }, reports ++ answering ++ fallback )
+
+
+abandon : ConnId -> RequestId -> Model -> ( Model, List Effect )
+abandon conn id model =
+    case Dict.get (connKey conn) model.conns of
+        Just c ->
+            if c.phase == Exchanging id then
+                ( putConn conn { c | phase = Closing { lingering = False } } model, [ CloseConn conn ] )
+
+            else
+                ( model, [] )
+
+        Nothing ->
+            ( model, [] )
 
 
 type Answer
@@ -658,17 +1381,18 @@ type Answer
     | Unanswered
 
 
-applyAnswer : RequestId -> Answer -> Job -> Model -> ( Job, Model, List Effect )
-applyAnswer id answer job model =
+applyAnswer : Answer -> Job -> Model -> ( Job, Model, List Effect )
+applyAnswer answer job model =
     case ( answer, job.client ) of
         ( Inline response, Waiting ) ->
-            ( { job | client = Answered }
-            , count (\l -> { l | responded = l.responded + 1 }) model
-            , [ Respond id response (connection model.config.linger job.body) ]
-            )
+            let
+                ( responded, effects ) =
+                    respond job.conn (dispositionOf job) response (count (\l -> { l | responded = l.responded + 1 }) model)
+            in
+            ( { job | client = Answered }, responded, effects )
 
         ( ByStream, Waiting ) ->
-            -- The Stream step writes the status line itself.
+            -- The Stream step writes the head and the bytes itself.
             ( { job | client = Answered }, count (\l -> { l | responded = l.responded + 1 }) model, [] )
 
         ( Inline _, Answered ) ->
@@ -685,19 +1409,6 @@ applyAnswer id answer job model =
 
         ( Unanswered, _ ) ->
             ( job, model, [] )
-
-
-connection : Response.Linger -> BodyState -> Response.Connection
-connection linger body =
-    case body of
-        Unread ->
-            Response.CloseAfter linger
-
-        NoBody ->
-            Response.KeepAlive
-
-        Drained ->
-            Response.KeepAlive
 
 
 {-| A body step that succeeded consumed the whole body.
@@ -746,10 +1457,10 @@ drained work txReport body =
         OpeningBlob _ _ ->
             body
 
-        Delivering ->
+        Delivering _ ->
             body
 
-        Closing ->
+        Finishing ->
             body
 
 
@@ -795,7 +1506,7 @@ continue model id job txReport =
             model.config
 
         finishWith program answer =
-            Just { answer = answer, work = Closing, program = program, meter = Nothing }
+            Just { answer = answer, work = Finishing, program = program, meter = Nothing }
     in
     case ( job.work, txReport.steps ) of
         ( ReceivingJson itemId suspended, [ Ok value ] ) ->
@@ -834,15 +1545,19 @@ continue model id job txReport =
 
                     else
                         let
-                            head =
-                                Response.streamHead file.size
+                            closes =
+                                not (persists model job.conn (dispositionOf job))
                         in
                         Just
                             { answer = ByStream
-                            , work = Delivering
+                            , work = Delivering { closes = closes }
                             , program =
                                 Plan.resume suspended
-                                    |> Plan.stream { length = file.size, status = head.status, headers = head.headers }
+                                    |> Plan.stream
+                                        { conn = job.conn
+                                        , length = file.size
+                                        , head = Response.serializeStreamHead (Date.fromMillis model.clock.wall) closes file.size
+                                        }
                                     |> Plan.release
                             , meter = Just { direction = Outbound, rate = config.deliveryRate, moved = 0, running = False, checkAt = 0, required = 0 }
                             }
@@ -927,7 +1642,7 @@ judge job txReport =
                 _ ->
                     Verdict.quiet
 
-        Delivering ->
+        Delivering _ ->
             case txReport.steps of
                 [ Err error ] ->
                     case Io.classify error of
@@ -943,7 +1658,7 @@ judge job txReport =
                 _ ->
                     Verdict.quiet
 
-        Closing ->
+        Finishing ->
             Verdict.quiet
 
 
@@ -955,6 +1670,9 @@ bodyFailure error =
 
         Io.Reset ->
             ( Just (Verdict.hostProblem Response.BadRequest "the request body was cut off" error), [] )
+
+        Io.Malformed ->
+            ( Just (Verdict.hostProblem Response.BadRequest "the chunked body is malformed" error), [] )
 
         Io.Cancelled ->
             Verdict.quiet
@@ -1027,6 +1745,9 @@ fetchFailure error =
         Io.TooLarge ->
             Verdict.fatal "calling the upstream" error
 
+        Io.Malformed ->
+            Verdict.fatal "calling the upstream" error
+
         Io.Unrecognized ->
             Verdict.fatal "calling the upstream" error
 
@@ -1077,6 +1798,9 @@ openFailure id error =
         Io.TooLarge ->
             Verdict.fatal "opening the blob" error
 
+        Io.Malformed ->
+            Verdict.fatal "opening the blob" error
+
         Io.Unrecognized ->
             Verdict.fatal "opening the blob" error
 
@@ -1104,55 +1828,48 @@ declaredBody request =
         Request.Length _ ->
             Unread
 
-        Request.Unsized ->
+        Request.Chunked ->
             Unread
 
 
-begin : RequestId -> BodyState -> Outcome -> Model -> ( Model, List Effect )
-begin id body outcome model =
+begin : RequestId -> ConnId -> Disposition -> Outcome -> Model -> ( Model, List Effect )
+begin id conn shape outcome model =
     case outcome of
         Now response ->
-            answerNow id body response model
+            answerNow conn shape response model
 
         Start start ->
-            ( putJob id { client = Waiting, work = start.work, body = body, meter = start.meter, deadline = model.now + start.deadlineMs } model
+            ( putJob id
+                { client = Waiting
+                , conn = conn
+                , work = start.work
+                , body = shape.body
+                , persistence = shape.persistence
+                , meter = start.meter
+                , deadline = model.clock.mono + start.deadlineMs
+                }
+                model
             , [ Begin (Exchange id) start.program ]
             )
 
 
-answerNow : RequestId -> BodyState -> Response -> Model -> ( Model, List Effect )
-answerNow id body response model =
-    ( count (\l -> { l | responded = l.responded + 1 }) model
-    , [ Respond id response (connection model.config.linger body) ]
-    )
+answerNow : ConnId -> Disposition -> Response -> Model -> ( Model, List Effect )
+answerNow conn shape response model =
+    respond conn shape response (count (\l -> { l | responded = l.responded + 1 }) model)
 
 
-rejectWire : Request.Rejection -> Response
-rejectWire rejection =
-    case rejection of
-        Request.Malformed error ->
-            Response.problem Response.InternalServerError
-                "the bridge sent a request the router could not decode"
-                [ ( "decoderError", Encode.string (Decode.errorToString error) ) ]
-
-        Request.UnsupportedMethod method ->
-            Response.problem Response.NotImplemented
-                ("method " ++ method ++ " is not implemented")
-                [ ( "method", Encode.string method ) ]
-
-
-route : Model -> RequestId -> Request -> Outcome
-route model id request =
+route : Model -> RequestId -> ConnId -> Request -> Outcome
+route model id conn request =
     case Route.parse request.method request.path of
         Err mismatch ->
             Now (rejectRoute request mismatch)
 
         Ok r ->
-            dispatch model id request r
+            dispatch model id conn request r
 
 
-dispatch : Model -> RequestId -> Request -> Route -> Outcome
-dispatch model id request r =
+dispatch : Model -> RequestId -> ConnId -> Request -> Route -> Outcome
+dispatch model id conn request r =
     let
         config =
             model.config
@@ -1160,11 +1877,18 @@ dispatch model id request r =
         inbound =
             Just { direction = Inbound, rate = config.transferRate, moved = 0, running = False, checkAt = 0, required = 0 }
 
+        invite =
+            if request.expectsContinue then
+                Just Response.continue
+
+            else
+                Nothing
+
         within limit start =
             case request.body of
                 Request.Length n ->
                     if n > limit then
-                        -- Refused from the headers alone: not one body byte read.
+                        -- Refused from the head alone: not one body byte read.
                         Now
                             (Response.problem Response.PayloadTooLarge
                                 ("the declared body of " ++ String.fromInt n ++ " bytes exceeds " ++ String.fromInt limit)
@@ -1174,14 +1898,17 @@ dispatch model id request r =
                     else
                         start
 
-                Request.Unsized ->
+                Request.Chunked ->
                     start
 
                 Request.NoBody ->
                     start
 
+        framing =
+            Io.reading config.chunked request.body
+
         reading =
-            Plan.fresh |> Plan.readBody { maxBytes = config.jsonLimit, sendContinue = request.expectsContinue }
+            Plan.fresh |> Plan.readBody { conn = conn, framing = framing, maxBytes = config.jsonLimit, invite = invite }
 
         readBody work program =
             within config.jsonLimit <|
@@ -1215,7 +1942,7 @@ dispatch model id request r =
         Route.Upload itemId ->
             let
                 spec =
-                    Commit.upload model.layout id itemId { maxBytes = config.uploadLimit, sendContinue = request.expectsContinue }
+                    Commit.upload model.layout id itemId { conn = conn, framing = framing, maxBytes = config.uploadLimit, invite = invite }
             in
             within config.uploadLimit <|
                 Start
@@ -1412,7 +2139,7 @@ janitorReported txReport model =
                 ( Surveying _, Tx.Settled ) ->
                     case txReport.steps of
                         [ Err error ] ->
-                            report Janitor [ Unclassified "listing the parts directory" error ] { checked | sweep = Idle }
+                            report Janitor [ Unclassified "listing the parts directory" error ] (idle checked)
 
                         _ ->
                             janitorBroke "a survey settled without its listing" checked
@@ -1441,7 +2168,7 @@ janitorBroke detail model =
             ( { reported | phase = Stopped, sweep = Idle }, faults ++ [ Halt "the data directory could not be prepared" ] )
 
         _ ->
-            ( { reported | sweep = Idle }, faults ++ [ Extend Janitor (Plan.end Plan.fresh) ] )
+            ( idle reported, faults ++ [ Extend Janitor (Plan.end Plan.fresh) ] )
 
 
 prepared : Tx.Report -> Model -> ( Model, List Effect )
@@ -1517,18 +2244,18 @@ surveyed suspended txReport model =
 discarded : List Part -> Tx.Report -> Model -> ( Model, List Effect )
 discarded doomed txReport model =
     let
-        idle =
-            { model | sweep = Idle }
+        rested =
+            idle model
     in
     case ( doomed, txReport.steps ) of
         ( [], [] ) ->
-            ( idle, [] )
+            ( rested, [] )
 
         ( _, [ Ok value ] ) ->
             case Decode.decodeValue (Decode.field "outcomes" (Decode.list Io.outcomeDecoder)) value of
                 Ok outcomes ->
                     if List.length outcomes /= List.length doomed then
-                        report Janitor [ Anomaly "an unlink report that does not match what was doomed" ] idle
+                        report Janitor [ Anomaly "an unlink report that does not match what was doomed" ] rested
 
                     else
                         let
@@ -1550,16 +2277,16 @@ discarded doomed txReport model =
                                     )
                                     results
                         in
-                        report Janitor faults (count (\l -> { l | swept = l.swept + removed }) idle)
+                        report Janitor faults (count (\l -> { l | swept = l.swept + removed }) rested)
 
                 Err error ->
-                    report Janitor [ Anomaly ("an unlink report that does not decode: " ++ Decode.errorToString error) ] idle
+                    report Janitor [ Anomaly ("an unlink report that does not decode: " ++ Decode.errorToString error) ] rested
 
         ( _, [ Err error ] ) ->
-            report Janitor [ Unclassified "removing stale parts" error ] idle
+            report Janitor [ Unclassified "removing stale parts" error ] rested
 
         _ ->
-            report Janitor [ Anomaly "a discard settled without the outcome of its unlinks" ] idle
+            report Janitor [ Anomaly "a discard settled without the outcome of its unlinks" ] rested
 
 
 isOk : Result e a -> Bool
@@ -1666,68 +2393,11 @@ heldPart job =
         OpeningBlob _ _ ->
             Nothing
 
-        Delivering ->
+        Delivering _ ->
             Nothing
 
-        Closing ->
+        Finishing ->
             Nothing
-
-
-
--- LINGERING CONNECTIONS
-
-
-type Release
-    = HungUp
-    | DeadlinePassed
-    | BudgetSpent
-    | PoolFull
-
-
-releaseDecoder : Decode.Decoder ( Release, Int )
-releaseDecoder =
-    Decode.map2 Tuple.pair
-        (Decode.field "how" Decode.string
-            |> Decode.andThen
-                (\how ->
-                    case how of
-                        "hungUp" ->
-                            Decode.succeed HungUp
-
-                        "deadline" ->
-                            Decode.succeed DeadlinePassed
-
-                        "budget" ->
-                            Decode.succeed BudgetSpent
-
-                        "poolFull" ->
-                            Decode.succeed PoolFull
-
-                        _ ->
-                            Decode.fail ("no such release: " ++ how)
-                )
-        )
-        (Decode.field "discarded" Decode.int)
-
-
-tally : Release -> Int -> Lingered -> Lingered
-tally how bytes lingered =
-    let
-        counted =
-            { lingered | bytesDiscarded = lingered.bytesDiscarded + bytes }
-    in
-    case how of
-        HungUp ->
-            { counted | hungUp = counted.hungUp + 1 }
-
-        DeadlinePassed ->
-            { counted | deadlinePassed = counted.deadlinePassed + 1 }
-
-        BudgetSpent ->
-            { counted | budgetSpent = counted.budgetSpent + 1 }
-
-        PoolFull ->
-            { counted | poolFull = counted.poolFull + 1 }
 
 
 
@@ -1745,14 +2415,37 @@ withJob id model f =
             ( model, [] )
 
 
+{-| A connection the server has forgotten has nothing left to decide: its
+fd is closed.
+-}
+withConn : ConnId -> Model -> (Conn -> ( Model, List Effect )) -> ( Model, List Effect )
+withConn conn model f =
+    case Dict.get (connKey conn) model.conns of
+        Just c ->
+            f c
+
+        Nothing ->
+            ( model, [] )
+
+
 key : RequestId -> String
 key =
     Request.idToString
 
 
+connKey : ConnId -> String
+connKey =
+    Request.connIdToString
+
+
 putJob : RequestId -> Job -> Model -> Model
 putJob id job model =
     { model | jobs = Dict.insert (key id) job model.jobs }
+
+
+putConn : ConnId -> Conn -> Model -> Model
+putConn conn c model =
+    { model | conns = Dict.insert (connKey conn) c model.conns }
 
 
 count : (Ledger -> Ledger) -> Model -> Model
@@ -1809,6 +2502,7 @@ encodeStats model =
         , ( "faults", Encode.int l.faults )
         , ( "orphans", Encode.int l.orphans )
         , ( "swept", Encode.int l.swept )
+        , ( "connections", Encode.object [ ( "accepted", Encode.int l.accepted ), ( "open", Encode.int (Dict.size model.conns) ) ] )
         , ( "lingered"
           , Encode.object
                 [ ( "hungUp", Encode.int l.lingered.hungUp )

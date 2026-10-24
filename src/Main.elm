@@ -2,45 +2,30 @@ port module Main exposing (main)
 
 {-| Port wiring only. Every decision is made in `Server.step`.
 
-One outbound port. Each update sends at most one message on it: the ordered
-array of instructions that update produced. `Cmd.batch` reverses commands on
-a single port and races commands on different ports, so nothing that needs an
-order is ever split across two `Cmd`s.
+One port each way. Inbound, every event the bridge reports, decoded by
+`Server.eventDecoder`; an event that does not decode becomes `Garbled`,
+never a silent drop. Outbound, each update sends at most one message: the
+ordered array of instructions that update produced. `Cmd.batch` reverses
+commands on a single port and races commands on different ports, so
+nothing that needs an order is ever split across two `Cmd`s.
 
-Inbound ports carry ids as typed strings next to an untyped payload, so Elm
-never holds a request or a report it cannot address.
+There are no Elm timers. The clock is the bridge's, read at each event,
+and the only alarm is the one `Server` asks for.
 
 -}
 
-import Dict
 import Http.Request as Request
-import Http.Response as Response
 import Io
 import Json.Decode as Decode
 import Json.Encode as Encode
+import Kernel
 import Plan
 import Server
-import Time
 import Tx
 import Verdict
 
 
-port incomingRequest : (( String, Int, Decode.Value ) -> msg) -> Sub msg
-
-
-port clientDisconnected : (String -> msg) -> Sub msg
-
-
-port txReported : (( String, Decode.Value ) -> msg) -> Sub msg
-
-
-port txProgress : ({ request : String, bytes : Int, running : Bool, at : Int } -> msg) -> Sub msg
-
-
-port serverClosed : (() -> msg) -> Sub msg
-
-
-port connectionReleased : (( String, Decode.Value ) -> msg) -> Sub msg
+port fromBridge : (Decode.Value -> msg) -> Sub msg
 
 
 port toBridge : List Encode.Value -> Cmd msg
@@ -64,28 +49,16 @@ main =
                 in
                 ( next, send effects )
         , subscriptions =
-            \model ->
-                Sub.batch
-                    [ incomingRequest (\( id, at, wire ) -> Server.Received (Request.idFromString id) at wire)
-                    , clientDisconnected (Request.idFromString >> Server.ClientGone)
-                    , txReported (\( tx, value ) -> Server.Reported (Server.ownerFromKey tx) value)
-                    , txProgress (\p -> Server.Progressed (Request.idFromString p.request) p.bytes p.running p.at)
-                    , serverClosed (\() -> Server.Closed)
-                    , connectionReleased (\( id, value ) -> Server.Released (Request.idFromString id) value)
+            \_ ->
+                fromBridge
+                    (\value ->
+                        case Decode.decodeValue Server.eventDecoder value of
+                            Ok msg ->
+                                msg
 
-                    -- The clocks run only while something needs them.
-                    , if Dict.isEmpty model.jobs then
-                        Sub.none
-
-                      else
-                        Time.every 100 (Time.posixToMillis >> Server.Tick)
-                    , case Server.sweepEvery model of
-                        Just ms ->
-                            Time.every (toFloat ms) (\_ -> Server.SweepDue)
-
-                        Nothing ->
-                            Sub.none
-                    ]
+                            Err error ->
+                                Server.Garbled (Decode.errorToString error)
+                    )
         }
 
 
@@ -95,66 +68,77 @@ subscribed, because its manager starts with a zero-delay sleep.
 -}
 send : List Server.Effect -> Cmd msg
 send effects =
-    case List.filterMap instruction effects of
+    case effects of
         [] ->
             Cmd.none
 
-        instructions ->
-            toBridge instructions
+        _ ->
+            toBridge (List.map instruction effects)
 
 
-instruction : Server.Effect -> Maybe Encode.Value
+instruction : Server.Effect -> Encode.Value
 instruction effect =
-    case effect of
-        Server.Respond id response connection ->
-            let
-                wire =
-                    Response.toWire connection response
-            in
-            Just
-                (Encode.object
-                    [ ( "do", Encode.string "respond" )
-                    , ( "request", Encode.string (Request.idToString id) )
-                    , ( "status", Encode.int wire.status )
-                    , ( "headers", Encode.list Encode.string wire.headers )
-                    , ( "body", Encode.string wire.body )
-                    , ( "linger"
-                      , case wire.linger of
-                            Just linger ->
-                                Encode.object
-                                    [ ( "deadlineMs", Encode.int linger.deadlineMs )
-                                    , ( "maxBytes", Encode.int linger.maxBytes )
-                                    , ( "maxSockets", Encode.int linger.maxSockets )
-                                    ]
+    let
+        doing name fields =
+            Encode.object (( "do", Encode.string name ) :: fields)
 
-                            Nothing ->
-                                Encode.null
-                      )
-                    ]
-                )
+        connField conn =
+            ( "conn", Encode.string (Request.connIdToString conn) )
+    in
+    case effect of
+        Server.Send conn text ->
+            doing "send" [ connField conn, ( "text", Encode.string text ) ]
+
+        Server.AwaitHead conn maxBytes ->
+            doing "awaitHead" [ connField conn, ( "maxBytes", Encode.int maxBytes ) ]
+
+        Server.CloseConn conn ->
+            doing "close" [ connField conn ]
+
+        Server.Dissipate conn profile ->
+            doing "dissipate"
+                [ connField conn
+                , ( "deadlineMs", Encode.int profile.deadlineMs )
+                , ( "budgetBytes", Encode.int profile.budgetBytes )
+                , ( "whenSpent"
+                  , Encode.string <|
+                        case profile.whenSpent of
+                            Kernel.Cut ->
+                                "cut"
+
+                            Kernel.Hold ->
+                                "hold"
+                  )
+                ]
 
         Server.Begin owner program ->
-            Just (Tx.encodeBegin (Server.ownerKey owner) (Plan.steps program) (Plan.continuation program))
+            Tx.encodeBegin (Server.ownerKey owner) (Plan.steps program) (Plan.continuation program)
 
         Server.Extend owner program ->
-            Just (Tx.encodeExtend (Server.ownerKey owner) (Plan.steps program) (Plan.continuation program))
+            Tx.encodeExtend (Server.ownerKey owner) (Plan.steps program) (Plan.continuation program)
 
         Server.Abort id ->
-            Just (Tx.encodeAbort (Server.ownerKey (Server.Exchange id)))
+            Tx.encodeAbort (Server.ownerKey (Server.Exchange id))
 
         Server.Report owner fault ->
-            Just
-                (Encode.object
-                    [ ( "do", Encode.string "log" )
-                    , ( "fault", encodeFault owner fault )
-                    ]
-                )
+            doing "log" [ ( "fault", encodeFault owner fault ) ]
+
+        Server.Note id conn method target ->
+            doing "note"
+                [ ( "request", Encode.string (Request.idToString id) )
+                , connField conn
+                , ( "method", Encode.string method )
+                , ( "target", Encode.string target )
+                ]
+
+        Server.Alarm inMs ->
+            doing "alarm" [ ( "inMs", Maybe.withDefault Encode.null (Maybe.map Encode.int inMs) ) ]
 
         Server.Listen ->
-            Just (Encode.object [ ( "do", Encode.string "listen" ) ])
+            doing "listen" []
 
         Server.Halt reason ->
-            Just (Encode.object [ ( "do", Encode.string "halt" ), ( "reason", Encode.string reason ) ])
+            doing "halt" [ ( "reason", Encode.string reason ) ]
 
 
 encodeFault : Server.Owner -> Verdict.Fault -> Encode.Value

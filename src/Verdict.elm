@@ -101,6 +101,9 @@ diskFailure context error =
         Io.TooLarge ->
             fatal context error
 
+        Io.Malformed ->
+            fatal context error
+
         Io.Unrecognized ->
             fatal context error
 
@@ -144,6 +147,9 @@ orphanUnlessGone path error =
             [ Orphaned path error ]
 
         Io.TooLarge ->
+            [ Orphaned path error ]
+
+        Io.Malformed ->
             [ Orphaned path error ]
 
         Io.Unrecognized ->
